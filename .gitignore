@@ -1,5 +1,11 @@
 .env
 state.json
+state.json*.tmp
+accounts.json
+users.sqlite3
+users.sqlite3-shm
+users.sqlite3-wal
 __pycache__/
 .auth/
 node_modules/
+.test-*/
