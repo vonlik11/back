@@ -1,0 +1,9 @@
+{
+  "name": "ai-marketolog-chatgpt-auth",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {"login": "node siwc.mjs login", "login:new": "node siwc.mjs login-new", "status": "node siwc.mjs status"},
+  "dependencies": {"jose": "^6.1.0"},
+  "engines": {"node": ">=22.12.0"}
+}
