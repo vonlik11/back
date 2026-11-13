@@ -9,12 +9,14 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const command = process.argv[2];
 const telegramId = process.argv[3];
-if ((telegramId !== undefined && !/^[1-9][0-9]{0,15}$/.test(telegramId)) || (command === "login-telegram" && !telegramId)) {
-  console.error("Укажите корректный Telegram ID.");
+const platform = command?.endsWith("-max") ? "max" : "telegram";
+const accountCommand = ["login-telegram", "login-max", "infer-max", "infer-api-max", "connect-api-max"].includes(command);
+if ((telegramId !== undefined && !/^[1-9][0-9]{0,15}$/.test(telegramId)) || (["login-telegram", "login-max"].includes(command) && !telegramId)) {
+  console.error("Укажите корректный ID аккаунта.");
   process.exit(2);
 }
 const authRoot = path.join(directory, ".auth");
-const authDir = telegramId ? path.join(authRoot, "telegram", telegramId) : authRoot;
+const authDir = telegramId ? path.join(authRoot, platform, telegramId) : authRoot;
 const credFile = path.join(authDir, "chatgpt.enc");
 const apiKeyFile = path.join(authDir, "api-key.enc");
 const providerFile = path.join(authDir, "provider");
@@ -250,19 +252,20 @@ async function infer(payload, useApiKey = false) {
 if (command === "login") await login();
 else if (command === "login-new") await login(true);
 else if (command === "login-telegram") await login(false, true);
+else if (command === "login-max") await login(false, true);
 else if (command === "status") {
   try { const c = loadCredentials(); console.log(JSON.stringify({ connected: Boolean(c.accessToken && c.scopes.includes("chatgpt.tokens.use.direct") && (c.expiresAt > Date.now() + 60_000 || c.refreshToken)), email: c.email })); }
   catch { console.log(JSON.stringify({ connected: false })); }
-} else if (["infer", "infer-api", "connect-api"].includes(command)) {
+} else if (["infer", "infer-api", "connect-api", "infer-max", "infer-api-max", "connect-api-max"].includes(command)) {
   let input = ""; for await (const chunk of process.stdin) input += chunk;
   try {
-    if (command !== "infer" && !telegramId) throw new Error("missing_account");
+    if (accountCommand && !telegramId) throw new Error("missing_account");
     const payload = JSON.parse(input);
-    if (command === "connect-api") await connectApiKey(payload.apiKey);
-    else await infer(payload, command === "infer-api");
+    if (["connect-api", "connect-api-max"].includes(command)) await connectApiKey(payload.apiKey);
+    else await infer(payload, ["infer-api", "infer-api-max"].includes(command));
   } catch (error) {
     const safeCode = /^(invalid_key|api_http_[0-9]{3})$/.test(error.message) ? error.message : "api_unavailable";
     process.stderr.write(command === "infer" ? error.message : safeCode);
     process.exitCode = 1;
   }
-} else { console.error("Use: node siwc.mjs login | status | infer | connect-api | infer-api"); process.exitCode = 2; }
+} else { console.error("Use: node siwc.mjs login | status | infer | connect-api | infer-api | login-max | infer-max"); process.exitCode = 2; }

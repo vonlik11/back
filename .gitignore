@@ -1,6 +1,8 @@
 .env
 state.json
 state.json*.tmp
+max_state.json
+max_state.tmp
 accounts.json
 users.sqlite3
 users.sqlite3-shm

@@ -10,7 +10,7 @@ class WebImageError(Exception):
     pass
 
 
-HEADERS = {"User-Agent": "AI-Marketolog/0.1 (Telegram editorial image search)"}
+HEADERS = {"User-Agent": "AI-Marketolog/0.1 (editorial image search)"}
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
 

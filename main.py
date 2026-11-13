@@ -231,6 +231,36 @@ def send_message(chat_id, text: str, markup: dict | None = None):
     return tg("sendMessage", payload)
 
 
+def main_menu_keyboard():
+    """Постоянная клавиатура с основными сценариями для личного чата."""
+    return {
+        "keyboard": [
+            [{"text": "✍️ Создать пост"}, {"text": "👤 Мой профиль"}],
+            [{"text": "📊 Мои публикации"}, {"text": "⏰ Расписание"}],
+            [{"text": "❓ Помощь"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+        "input_field_placeholder": "Напишите задачу или выберите действие",
+    }
+
+
+def send_main_menu(chat_id, text: str):
+    return send_message(chat_id, text, main_menu_keyboard())
+
+
+def register_bot_commands():
+    """Показывает команды в меню Telegram рядом с полем ввода."""
+    tg("setMyCommands", {"commands": [
+        {"command": "start", "description": "Главное меню"},
+        {"command": "post", "description": "Создать пост"},
+        {"command": "profile", "description": "Профиль компании"},
+        {"command": "analytics", "description": "Публикации и реакции"},
+        {"command": "schedule", "description": "Расписание черновиков"},
+        {"command": "help", "description": "Как пользоваться ботом"},
+    ]})
+
+
 def chatgpt_connected(chat_id: str) -> bool:
     return (ROOT / ".auth" / "telegram" / chat_id / "chatgpt.enc").is_file()
 
@@ -358,7 +388,7 @@ def connect_api_key(chat_id: str, key: str, message_id):
         send_message(chat_id, api_error(result.stderr.strip()) + " Пришлите ключ ещё раз или отправьте /cancel.")
         return
     api_key_requests.discard(chat_id)
-    send_message(chat_id, "✅ OpenAI API подключён. Следующие запросы пойдут через ваш проект OpenAI. Напишите тему поста.")
+    send_main_menu(chat_id, "✅ OpenAI API подключён. Следующие запросы пойдут через ваш проект OpenAI. Выберите действие ниже или напишите задачу сообщением.")
 
 
 def start_chatgpt_login(chat_id: str):
@@ -390,7 +420,7 @@ def start_chatgpt_login(chat_id: str):
                 if chatgpt_logins.get(chat_id) is not process:
                     return
             if exit_code == 0 and chatgpt_connected(chat_id):
-                send_message(chat_id, "✅ ChatGPT подключён. Напишите, какой пост подготовить, или отправьте /post с темой.")
+                send_main_menu(chat_id, "✅ ChatGPT подключён. Выберите действие ниже или напишите задачу сообщением.")
             else:
                 prompt_chatgpt(chat_id, "Подключение не завершилось. Попробуйте снова.\n\n")
         except (ValueError, KeyError, OSError, TelegramError, subprocess.TimeoutExpired):
@@ -564,13 +594,16 @@ def source_buttons(source):
 
 
 def draft_buttons(draft_id: str, has_image: bool = False, source: dict | None = None):
-    rows = [[
-        {"text": "✅ Одобрить и опубликовать", "callback_data": f"approve:{draft_id}"},
-        {"text": "↩️ Отклонить", "callback_data": f"reject:{draft_id}"},
-    ], [
-        {"text": "🔎 Найти фото", "callback_data": f"webimage:{draft_id}"},
-        {"text": "🎨 Сгенерировать", "callback_data": f"image:{draft_id}"},
-    ]]
+    # Разносим публикацию и отказ по разным строкам, чтобы их было проще
+    # прочитать и сложнее нажать случайно на маленьком экране.
+    rows = [
+        [{"text": "✅ Одобрить и опубликовать", "callback_data": f"approve:{draft_id}"}],
+        [{"text": "🗑 Отклонить · не публиковать", "callback_data": f"reject:{draft_id}"}],
+        [
+            {"text": "🔎 Найти фото", "callback_data": f"webimage:{draft_id}"},
+            {"text": "🎨 Создать картинку", "callback_data": f"image:{draft_id}"},
+        ],
+    ]
     if source_buttons(source):
         rows.append(source_buttons(source))
     if has_image:
@@ -950,9 +983,9 @@ def setup_step(chat_id: str, text: str, setup: dict):
     state["chats"].pop(chat_id, None)
     retire_drafts(chat_id)
     write_json(STATE_FILE, state)
-    summary = f"✅ {setup['display_name']}, {('профиль обновлён' if setup.get('mode') == 'edit' else 'регистрация завершена')}!\nКомпания: {setup['company_name']}\nКанал: {workspace['channel_label']}\n\n"
+    summary = f"✅ {setup['display_name']}, {('профиль обновлён' if setup.get('mode') == 'edit' else 'регистрация завершена')}!\nКомпания: {setup['company_name']}\nКанал: {workspace['channel_label']}\n\nВыберите действие кнопками ниже или напишите задачу сообщением."
     if ai_provider(chat_id):
-        send_message(chat_id, summary + "Напишите, какой пост подготовить.", {"inline_keyboard": account_buttons()})
+        send_main_menu(chat_id, summary)
     else:
         prompt_chatgpt(chat_id, summary)
 
@@ -994,6 +1027,15 @@ def handle_message(message: dict):
         while len(groups) > 100:
             groups.pop(next(iter(groups)))
         write_json(STATE_FILE, state)
+    menu_actions = {
+        "✍️ Создать пост": "/post",
+        "👤 Мой профиль": "/profile",
+        "📊 Мои публикации": "/analytics",
+        "⏰ Расписание": "/schedule",
+        "❓ Помощь": "/help",
+    }
+    if text in menu_actions:
+        text = menu_actions[text]
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text.startswith("/") else ""
     workspace = workspaces.get(chat_id)
     if command in ("/ai", "/api"):
@@ -1035,7 +1077,13 @@ def handle_message(message: dict):
         if command == "/start" and not ai_provider(chat_id):
             prompt_chatgpt(chat_id)
             return
-        send_message(chat_id, "Напишите задачу или /post тема. Можно прикрепить фото с подписью: оно попадёт в пост. Без вашего фото подберу иллюстрацию из интернета, при необходимости сгенерирую. Для поста без фото добавьте «только текст».\n/register — регистрация\n/profile — мой профиль\n/setup — изменить данные\n/ai — способ подключения\n/chatgpt — подключить ChatGPT\n/api — подключить ключ OpenAI\n/analytics — реакции и публикации\n/findimage описание — поиск фото к черновику\n/image описание — генерация картинки\n/schedule — расписание\n/status — статус черновика\n/cancel — отменить настройку или отложенное фото\n«переделай: …» — изменить последний черновик", {"inline_keyboard": account_buttons()})
+        send_main_menu(chat_id,
+            "Главное меню\n\n"
+            "1. Нажмите «Создать пост» или напишите задачу своими словами.\n"
+            "2. Проверьте черновик и изображение.\n"
+            "3. Одобрите публикацию или отклоните её. Без одобрения пост не выйдет.\n\n"
+            "Для правок напишите: «переделай: …». Фото можно прикрепить к сообщению."
+        )
         return
     if command == "/profile":
         if not workspace or not workspace.get("registration"):
@@ -1318,6 +1366,10 @@ def scheduled_job():
 def run_bot():
     if check_connection():
         raise SystemExit("Отключите прежнюю webhook-интеграцию перед запуском. Настройки Telegram не изменены.")
+    try:
+        register_bot_commands()
+    except TelegramError as exc:
+        print(f"Не удалось обновить меню команд Telegram: {exc}")
     print(f"Бот запущен. Модель: {CHATGPT_MODEL}; часовой пояс: {TIMEZONE}; расписание: {SCHEDULE_TIME}")
     backoff = 2
     while True:

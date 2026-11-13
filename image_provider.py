@@ -53,5 +53,5 @@ def generate_image(prompt, user_id):
     except (KeyError, IndexError, TypeError, ValueError, binascii.Error):
         raise ImageError("Сервис не вернул изображение. Попробуйте изменить описание.") from None
     if not image.startswith(b"\xff\xd8\xff") or len(image) > 10 * 1024 * 1024:
-        raise ImageError("Изображение имеет неподходящий формат или размер для Telegram.")
+        raise ImageError("Изображение имеет неподходящий формат или размер для публикации.")
     return image
