@@ -3,6 +3,8 @@ state.json
 state.json*.tmp
 max_state.json
 max_state.tmp
+vk_state.json
+vk_state.tmp
 accounts.json
 users.sqlite3
 users.sqlite3-shm

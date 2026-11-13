@@ -79,5 +79,5 @@ def download_image(url):
     except (urllib.error.URLError, TimeoutError, OSError):
         raise WebImageError("Не удалось загрузить найденное изображение.") from None
     if len(image) > MAX_IMAGE_BYTES or not (image.startswith(b"\xff\xd8\xff") or image.startswith(b"\x89PNG\r\n\x1a\n")):
-        raise WebImageError("Найденный файл не подходит для публикации в Telegram.")
+        raise WebImageError("Найденный файл не подходит для публикации в социальной сети.")
     return image

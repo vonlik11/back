@@ -9,9 +9,9 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const command = process.argv[2];
 const telegramId = process.argv[3];
-const platform = command?.endsWith("-max") ? "max" : "telegram";
-const accountCommand = ["login-telegram", "login-max", "infer-max", "infer-api-max", "connect-api-max"].includes(command);
-if ((telegramId !== undefined && !/^[1-9][0-9]{0,15}$/.test(telegramId)) || (["login-telegram", "login-max"].includes(command) && !telegramId)) {
+const platform = command?.endsWith("-max") ? "max" : command?.endsWith("-vk") ? "vk" : "telegram";
+const accountCommand = ["login-telegram", "login-max", "login-vk", "infer-max", "infer-api-max", "connect-api-max", "infer-vk"].includes(command);
+if ((telegramId !== undefined && !/^[1-9][0-9]{0,15}$/.test(telegramId)) || (["login-telegram", "login-max", "login-vk"].includes(command) && !telegramId)) {
   console.error("Укажите корректный ID аккаунта.");
   process.exit(2);
 }
@@ -253,10 +253,11 @@ if (command === "login") await login();
 else if (command === "login-new") await login(true);
 else if (command === "login-telegram") await login(false, true);
 else if (command === "login-max") await login(false, true);
+else if (command === "login-vk") await login(false, true);
 else if (command === "status") {
   try { const c = loadCredentials(); console.log(JSON.stringify({ connected: Boolean(c.accessToken && c.scopes.includes("chatgpt.tokens.use.direct") && (c.expiresAt > Date.now() + 60_000 || c.refreshToken)), email: c.email })); }
   catch { console.log(JSON.stringify({ connected: false })); }
-} else if (["infer", "infer-api", "connect-api", "infer-max", "infer-api-max", "connect-api-max"].includes(command)) {
+} else if (["infer", "infer-api", "connect-api", "infer-max", "infer-api-max", "connect-api-max", "infer-vk"].includes(command)) {
   let input = ""; for await (const chunk of process.stdin) input += chunk;
   try {
     if (accountCommand && !telegramId) throw new Error("missing_account");
@@ -265,7 +266,18 @@ else if (command === "status") {
     else await infer(payload, ["infer-api", "infer-api-max"].includes(command));
   } catch (error) {
     const safeCode = /^(invalid_key|api_http_[0-9]{3})$/.test(error.message) ? error.message : "api_unavailable";
-    process.stderr.write(command === "infer" ? error.message : safeCode);
+    if (command === "infer-vk") {
+      const detail = String(error?.message || "");
+      let code = "api_unavailable";
+      if (/ChatGPT ещё не подключён|missing_account/i.test(detail)) code = "chatgpt_not_connected";
+      else if (/invalid_grant|refresh token|token.*expired|401/i.test(detail)) code = "chatgpt_session_expired";
+      else if (/scope|plan.*разреш|permission|403/i.test(detail)) code = "chatgpt_access_denied";
+      else if (/model_not_found|unsupported_model|model.*not found|404/i.test(detail)) code = "chatgpt_model_unavailable";
+      else if (/fetch failed|ECONN|ETIMEDOUT|ENOTFOUND|network|UND_ERR|SSL/i.test(detail)) code = "openai_network_error";
+      process.stderr.write(code);
+    } else {
+      process.stderr.write(command === "infer" ? error.message : safeCode);
+    }
     process.exitCode = 1;
   }
-} else { console.error("Use: node siwc.mjs login | status | infer | connect-api | infer-api | login-max | infer-max"); process.exitCode = 2; }
+} else { console.error("Use: node siwc.mjs login | status | infer | connect-api | infer-api | login-max | infer-max | login-vk | infer-vk"); process.exitCode = 2; }
