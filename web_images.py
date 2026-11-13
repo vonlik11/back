@@ -12,6 +12,7 @@ class WebImageError(Exception):
 
 HEADERS = {"User-Agent": "AI-Marketolog/0.1 (Telegram editorial image search)"}
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+ALLOWED_LICENSES = {"cc0", "public-domain"}
 
 
 def plain_text(value):
@@ -41,7 +42,7 @@ def search_images(query):
     }
     request = urllib.request.Request("https://commons.wikimedia.org/w/api.php?" + urllib.parse.urlencode(params), headers=HEADERS)
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(request, timeout=8) as response:
             data = json.load(response)
     except (urllib.error.URLError, TimeoutError, OSError, ValueError):
         raise WebImageError("Поиск изображений временно недоступен.") from None
@@ -56,7 +57,9 @@ def search_images(query):
         meta = info.get("extmetadata", {})
         license_name = plain_text(meta.get("LicenseShortName", {}).get("value", ""))
         url = info.get("thumburl") or info.get("url", "")
-        if license_name.casefold() not in ("cc0", "public domain") or not safe_image_url(url):
+        normalized_license = re.sub(r"[^a-z0-9]+", "-", license_name.casefold()).strip("-")
+        reusable_license = normalized_license in ALLOWED_LICENSES or bool(re.fullmatch(r"cc-by(?:-sa)?(?:-[0-9]+(?:-[0-9]+)?)?", normalized_license))
+        if not reusable_license or not safe_image_url(url):
             continue
         if info.get("mime") not in ("image/jpeg", "image/png") or min(info.get("width", 0), info.get("height", 0)) < 400:
             continue
@@ -65,6 +68,7 @@ def search_images(query):
             "download_url": url, "title": plain_text(page.get("title", ""))[:200],
             "description": plain_text(meta.get("ImageDescription", {}).get("value", ""))[:700],
             "author": plain_text(meta.get("Artist", {}).get("value", ""))[:200], "license": license_name,
+            "license_url": plain_text(meta.get("LicenseUrl", {}).get("value", ""))[:500],
         })
     return results[:6]
 
@@ -74,7 +78,7 @@ def download_image(url):
         raise WebImageError("Недопустимый адрес изображения.")
     request = urllib.request.Request(url, headers=HEADERS)
     try:
-        with urllib.request.build_opener(ImageRedirectHandler()).open(request, timeout=25) as response:
+        with urllib.request.build_opener(ImageRedirectHandler()).open(request, timeout=12) as response:
             image = response.read(MAX_IMAGE_BYTES + 1)
     except (urllib.error.URLError, TimeoutError, OSError):
         raise WebImageError("Не удалось загрузить найденное изображение.") from None

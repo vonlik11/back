@@ -197,13 +197,14 @@ async function getAccessToken() {
   return updated;
 }
 
-const model = process.env.CHATGPT_MODEL || "gpt-6.1-sol";
+const chatgptModel = process.env.CHATGPT_MODEL || "gpt-6.1-sol";
+const apiModel = process.env.OPENAI_API_MODEL || "gpt-5.4-mini";
 
 async function connectApiKey(apiKey) {
   if (!telegramId || typeof apiKey !== "string" || !/^sk-[A-Za-z0-9_-]{16,500}$/.test(apiKey) || apiKey.startsWith("sk-admin-")) {
     throw new Error("invalid_key");
   }
-  const response = await fetch(`https://api.openai.com/v1/models/${encodeURIComponent(model)}`, {
+  const response = await fetch(`https://api.openai.com/v1/models/${encodeURIComponent(apiModel)}`, {
     headers: { authorization: `Bearer ${apiKey}` },
     signal: AbortSignal.timeout(20_000),
     redirect: "error",
@@ -221,7 +222,7 @@ async function infer(payload, useApiKey = false) {
   const input = [];
   for (const item of payload.history || []) input.push({ role: item.role === "assistant" ? "assistant" : "user", content: item.text });
   input.push({ role: "user", content: payload.prompt });
-  const response = await fetch("https://api.openai.com/v1/responses", { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ model, instructions: payload.instructions, input, store: false, stream: true }), redirect: "error" });
+  const response = await fetch("https://api.openai.com/v1/responses", { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ model: useApiKey ? apiModel : chatgptModel, ...(useApiKey && apiModel.startsWith("gpt-5") ? { reasoning: { effort: "low" } } : {}), instructions: payload.instructions, input, store: false, stream: true }), redirect: "error" });
   if (!response.ok) {
     if (useApiKey) {
       await response.body?.cancel();
@@ -247,21 +248,49 @@ async function infer(payload, useApiKey = false) {
   process.stdout.write(JSON.stringify({ text }));
 }
 
+async function generateImageWithApiKey(payload) {
+  if (!telegramId || !fs.existsSync(apiKeyFile)) throw new Error("api_unavailable");
+  const apiKey = unprotect(fs.readFileSync(apiKeyFile, "utf8"));
+  const response = await fetch("https://api.openai.com/v1/images/generations", {
+    method: "POST",
+    headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      model: process.env.OPENAI_IMAGE_MODEL || "gpt-image-2.5-flare",
+      prompt: payload.prompt,
+      size: "1024x1024",
+      quality: "medium",
+      output_format: "jpeg",
+      safety_identifier: payload.safetyIdentifier,
+    }),
+    signal: AbortSignal.timeout(180_000),
+    redirect: "error",
+  });
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw new Error(`image_http_${response.status}`);
+  }
+  const result = await response.json();
+  const image = result.data?.[0]?.b64_json;
+  if (typeof image !== "string" || !/^[A-Za-z0-9+/]+={0,2}$/.test(image)) throw new Error("api_unavailable");
+  process.stdout.write(JSON.stringify({ image }));
+}
+
 if (command === "login") await login();
 else if (command === "login-new") await login(true);
 else if (command === "login-telegram") await login(false, true);
 else if (command === "status") {
   try { const c = loadCredentials(); console.log(JSON.stringify({ connected: Boolean(c.accessToken && c.scopes.includes("chatgpt.tokens.use.direct") && (c.expiresAt > Date.now() + 60_000 || c.refreshToken)), email: c.email })); }
   catch { console.log(JSON.stringify({ connected: false })); }
-} else if (["infer", "infer-api", "connect-api"].includes(command)) {
+} else if (["infer", "infer-api", "connect-api", "image-api"].includes(command)) {
   let input = ""; for await (const chunk of process.stdin) input += chunk;
   try {
     if (command !== "infer" && !telegramId) throw new Error("missing_account");
     const payload = JSON.parse(input);
     if (command === "connect-api") await connectApiKey(payload.apiKey);
+    else if (command === "image-api") await generateImageWithApiKey(payload);
     else await infer(payload, command === "infer-api");
   } catch (error) {
-    const safeCode = /^(invalid_key|api_http_[0-9]{3})$/.test(error.message) ? error.message : "api_unavailable";
+    const safeCode = /^(invalid_key|api_http_[0-9]{3}|image_http_[0-9]{3})$/.test(error.message) ? error.message : "api_unavailable";
     process.stderr.write(command === "infer" ? error.message : safeCode);
     process.exitCode = 1;
   }
