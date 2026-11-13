@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -14,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import main as bot
 import image_provider
 import web_images
+from user_database import UserDatabase
 
 
 class BotTests(unittest.TestCase):
@@ -21,10 +23,18 @@ class BotTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix=".test-", dir=Path(__file__).resolve().parents[1])
         self.addCleanup(self.temp.cleanup)
         state = {"offset": 0, "chats": {}, "drafts": {}, "workspaces": {}}
-        for name, value in {"state": state, "workspaces": state["workspaces"], "STATE_FILE": Path(self.temp.name) / "state.json"}.items():
+        database = UserDatabase(Path(self.temp.name) / "users.sqlite3")
+        for name, value in {
+            "state": state, "workspaces": state["workspaces"], "STATE_FILE": Path(self.temp.name) / "state.json",
+            "user_database": database, "publish_jobs": {}, "reset_requests": {}, "api_key_requests": set(),
+            "chatgpt_logins": {},
+        }.items():
             p = patch.object(bot, name, value)
             p.start()
             self.addCleanup(p.stop)
+        provider = patch.object(bot, "ai_provider", side_effect=lambda chat_id: "chatgpt" if str(chat_id) in bot.workspaces else None)
+        provider.start()
+        self.addCleanup(provider.stop)
         self.calls = []
         self.count = 0
 
@@ -55,16 +65,68 @@ class BotTests(unittest.TestCase):
         return draft_id, draft
 
     def callback(self, action, draft_id, user=1):
-        bot.handle_callback({"id": "query", "data": f"{action}:{draft_id}", "from": {"id": user},
+        self.button(f"{action}:{draft_id}", user)
+
+    def button(self, data, user=1):
+        bot.handle_callback({"id": "query", "data": data, "from": {"id": user},
                              "message": {"chat": {"type": "private", "id": user}, "message_id": 100}})
+
+    def wait_for_publication(self, draft_id):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            jobs = [(job_id, job) for job_id, job in bot.publish_jobs.items() if job.get("draft_id") == draft_id]
+            if jobs and jobs[-1][1]["status"] in ("done", "failed"):
+                return jobs[-1]
+            time.sleep(0.01)
+        self.fail("Publication job did not finish")
+
+    def wait_for_login_cleanup(self, user):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if str(user) not in bot.chatgpt_logins:
+                return
+            time.sleep(0.01)
+        self.fail("ChatGPT login process was not released")
+
+    def test_failed_chatgpt_login_releases_chat_and_allows_retry(self):
+        class FailedLoginProcess:
+            def __init__(self):
+                self.stdout = io.StringIO('{"url":"https://auth.openai.com/example"}\n')
+                self.stderr = io.StringIO("oauth_error:invalid_grant\n")
+                self.returncode = 1
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                return None
+
+            def kill(self):
+                self.returncode = -9
+
+        with patch.object(bot.subprocess, "Popen", side_effect=[FailedLoginProcess(), FailedLoginProcess()]) as popen:
+            for attempt in (1, 2):
+                bot.start_chatgpt_login("1")
+                self.wait_for_login_cleanup("1")
+                self.assertEqual(popen.call_count, attempt)
+
+        sent_text = [payload["text"] for method, payload in self.calls if method == "sendMessage"]
+        self.assertEqual(sum("истёк или уже использован" in text for text in sent_text), 2)
 
     def test_registration_isolated_persistent_and_idempotent_start(self):
         self.message(1, "/start")
         self.message(2, "/start")
+        self.message(1, "timur@example.com")
+        self.message(1, "secure-password-123")
         self.message(1, "Тимур")
-        self.message(2, "Алия")
         self.message(1, "СалаватСтекло")
         self.message(1, "Производство стекла, деловой стиль")
+        self.message(2, "aliya@example.com")
+        self.message(2, "secure-password-456")
+        self.message(2, "Алия")
         self.assertNotIn("1", bot.workspaces)
         with patch.object(bot, "check_channel", return_value={"id": -1001, "username": "factory"}):
             self.message(1, "@factory")
@@ -78,7 +140,7 @@ class BotTests(unittest.TestCase):
         self.assertIn("СалаватСтекло", self.calls[-1][1]["text"])
 
     def test_channel_denial_does_not_register(self):
-        for text in ("/register", "Тимур", "Компания", "Описание"):
+        for text in ("/register", "timur@example.com", "secure-password-123", "Тимур", "Компания", "Описание"):
             self.message(1, text)
         with patch.object(bot, "check_channel", side_effect=bot.SetupError("Нет прав")):
             self.message(1, "@factory")
@@ -95,6 +157,8 @@ class BotTests(unittest.TestCase):
 
     def test_name_validation_and_resume(self):
         self.message(1, "/register")
+        self.message(1, "timur@example.com")
+        self.message(1, "secure-password-123")
         self.message(1, "x" * 81)
         self.assertEqual(bot.state["setup"]["1"]["step"], "name")
         saved = bot.read_json(bot.STATE_FILE, {})
@@ -111,7 +175,7 @@ class BotTests(unittest.TestCase):
         with patch.object(bot, "images_configured", return_value=False):
             self.callback("image", draft_id)
         self.assertEqual(draft["status"], "pending")
-        self.assertIn("OPENAI_API_KEY", self.calls[-1][1]["text"])
+        self.assertIn("/api", self.calls[-1][1]["text"])
 
     def test_generate_replaces_draft_and_repeated_click_does_not_regenerate(self):
         draft_id, old = self.draft()
@@ -149,32 +213,58 @@ class BotTests(unittest.TestCase):
         self.assertEqual(draft["status"], "pending")
         self.assertEqual(len(bot.state["drafts"]), 1)
 
+    def test_account_connect_and_reset_buttons(self):
+        self.workspace()
+        with patch.object(bot, "start_api_login") as api_login, patch.object(bot, "start_chatgpt_login") as chatgpt_login:
+            self.button("connect_api")
+            self.button("connect_chatgpt")
+        api_login.assert_called_once_with("1")
+        chatgpt_login.assert_called_once_with("1")
+        self.button("reset_account")
+        token = bot.reset_requests["1"]
+        self.assertIn(f"reset_confirm:{token}", self.calls[-1][1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"])
+        self.button(f"reset_cancel:{token}")
+        self.assertNotIn("1", bot.reset_requests)
+        self.assertIn("Сброс отменён", self.calls[-1][1]["text"])
+        self.button("reset_account")
+        token = bot.reset_requests["1"]
+
+        def reset_profile(chat_id):
+            bot.workspaces.pop(chat_id, None)
+            bot.state["drafts"].clear()
+
+        with patch.object(bot, "reset_account", side_effect=reset_profile) as reset:
+            self.button(f"reset_confirm:{token}")
+        reset.assert_called_once_with("1")
+        self.assertEqual(bot.state["setup"]["1"]["step"], "email")
+
     def test_photo_published_once_as_single_message(self):
         draft_id, draft = self.draft(photo="photo-id")
         self.calls.clear()
-        with patch.object(bot, "check_channel", return_value={"id": -1001}):
-            self.callback("approve", draft_id)
-            self.callback("approve", draft_id)
-        published = [(method, data) for method, data in self.calls if (data or {}).get("chat_id") == -1001]
+        self.callback("approve", draft_id)
+        self.callback("approve", draft_id)
+        job_id, job = self.wait_for_publication(draft_id)
+        published = [(method, data) for method, data in self.calls if (data or {}).get("chat_id") == "-1001"]
         self.assertEqual(len(published), 1)
         self.assertEqual(published[0][0], "sendPhoto")
         self.assertEqual(published[0][1]["caption"], draft["text"])
         self.assertEqual(published[0][1]["photo"], "photo-id")
         self.assertEqual(draft["status"], "published")
+        self.assertEqual(bot.publish_job_status("1", job_id)["status"], "done")
 
     def test_uncertain_photo_send_cannot_be_retried(self):
         draft_id, draft = self.draft(photo="photo-id")
         original = self.telegram.side_effect
         def timeout(method, payload=None):
-            if method == "sendPhoto" and payload["chat_id"] == -1001:
+            if method == "sendPhoto" and payload["chat_id"] == "-1001":
                 raise TimeoutError()
             return original(method, payload)
         self.telegram.side_effect = timeout
-        with patch.object(bot, "check_channel", return_value={"id": -1001}):
-            self.callback("approve", draft_id)
-            self.callback("approve", draft_id)
+        self.callback("approve", draft_id)
+        self.callback("approve", draft_id)
+        self.wait_for_publication(draft_id)
         self.assertEqual(draft["status"], "publication_unknown")
-        sends = [call for call in self.telegram.call_args_list if call.args[0] == "sendPhoto" and call.args[1]["chat_id"] == -1001]
+        sends = [call for call in self.telegram.call_args_list if call.args[0] == "sendPhoto" and call.args[1]["chat_id"] == "-1001"]
         self.assertEqual(len(sends), 1)
 
     def test_remove_image_retires_old_preview(self):
@@ -311,9 +401,9 @@ class BotTests(unittest.TestCase):
     def test_source_in_published_photo_buttons(self):
         draft_id, draft = self.draft(photo="web")
         draft["photo_source"] = {"kind": "web", "url": "https://commons.wikimedia.org/?curid=1"}
-        with patch.object(bot, "check_channel", return_value={"id": -1001}):
-            self.callback("approve", draft_id)
-        published = [data for method, data in self.calls if method == "sendPhoto" and data["chat_id"] == -1001][0]
+        self.callback("approve", draft_id)
+        self.wait_for_publication(draft_id)
+        published = [data for method, data in self.calls if method == "sendPhoto" and data["chat_id"] == "-1001"][0]
         self.assertEqual(published["reply_markup"]["inline_keyboard"][0][0]["url"], draft["photo_source"]["url"])
 
     def test_group_album_does_not_generate_multiple_posts(self):

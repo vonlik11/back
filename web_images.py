@@ -58,7 +58,7 @@ def search_images(query):
         license_name = plain_text(meta.get("LicenseShortName", {}).get("value", ""))
         url = info.get("thumburl") or info.get("url", "")
         normalized_license = re.sub(r"[^a-z0-9]+", "-", license_name.casefold()).strip("-")
-        reusable_license = normalized_license in ALLOWED_LICENSES or bool(re.fullmatch(r"cc-by(?:-sa)?(?:-[0-9]+(?:-[0-9]+)?)?", normalized_license))
+        reusable_license = normalized_license in ALLOWED_LICENSES or bool(re.fullmatch(r"cc0(?:-[0-9]+(?:-[0-9]+)?)?", normalized_license)) or bool(re.fullmatch(r"cc-by(?:-sa)?(?:-[0-9]+(?:-[0-9]+)?)?", normalized_license))
         if not reusable_license or not safe_image_url(url):
             continue
         if info.get("mime") not in ("image/jpeg", "image/png") or min(info.get("width", 0), info.get("height", 0)) < 400:

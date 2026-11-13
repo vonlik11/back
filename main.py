@@ -138,6 +138,17 @@ def recover_pending_state():
         return
 
 
+def recover_abandoned_publications():
+    changed = False
+    for draft in state.get("drafts", {}).values():
+        if draft.get("status") == "publishing":
+            draft["status"] = "publication_unknown"
+            draft["publish_error"] = "Бот перезапустился во время отправки. Проверьте канал: сообщение могло успеть появиться."
+            changed = True
+    if changed:
+        write_json(STATE_FILE, state)
+
+
 def retire_drafts(chat_id: str):
     for draft in state["drafts"].values():
         if draft["chat_id"] == chat_id and draft["status"] == "pending":
@@ -388,6 +399,20 @@ def save_openai_key(chat_id: str, key: str):
         raise SetupError(api_error(result.stderr.strip()))
 
 
+def chatgpt_login_error(stderr: str) -> str:
+    match = re.search(r"(?:^|\n)oauth_error:([a-z_]+)(?:\r?\n|$)", stderr or "")
+    code = match.group(1) if match else ""
+    messages = {
+        "invalid_grant": "Временный код входа OpenAI истёк или уже использован. Нажмите «Подключить ChatGPT» и завершите вход по новой ссылке.",
+        "access_denied": "Вход отменён или разрешение не подтверждено. Нажмите «Подключить ChatGPT» и разрешите использование плана.",
+        "permission_missing": "ChatGPT не выдал разрешение на использование плана. Подключитесь снова и подтвердите доступ к тарифу.",
+        "secure_storage": "Windows не смог безопасно сохранить вход. Запустите бота от того же пользователя Windows и проверьте PowerShell.",
+        "registration": "OpenAI не завершил регистрацию подключения. Запустите вход ещё раз по новой ссылке.",
+        "network": "Не удалось связаться с OpenAI при завершении входа. Проверьте интернет и подключитесь по новой ссылке.",
+    }
+    return messages.get(code, "Не удалось завершить вход в ChatGPT. Нажмите «Подключить ChatGPT» и используйте новую ссылку.")
+
+
 def start_chatgpt_login(chat_id: str):
     api_key_requests.discard(chat_id)
     with chatgpt_logins_lock:
@@ -398,7 +423,7 @@ def start_chatgpt_login(chat_id: str):
         try:
             process = subprocess.Popen(
                 ["node", "siwc.mjs", "login-telegram", chat_id], cwd=ROOT,
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8",
             )
         except OSError:
@@ -407,35 +432,55 @@ def start_chatgpt_login(chat_id: str):
         chatgpt_logins[chat_id] = process
 
     def finish_login():
+        def release_login():
+            with chatgpt_logins_lock:
+                if chatgpt_logins.get(chat_id) is process:
+                    chatgpt_logins.pop(chat_id, None)
+                    return True
+                return False
+
+        def stop_process():
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+
         try:
             result = json.loads(process.stdout.readline())
             link = result["url"]
             markup = {"inline_keyboard": [[{"text": "Войти в ChatGPT", "url": link}]]}
             send_message(chat_id, "Откройте ссылку в Telegram Desktop на компьютере с ботом. Войдите в ChatGPT и разрешите использование своего плана. Ссылка действует 10 минут.", markup)
             exit_code = process.wait(timeout=660)
-            with chatgpt_logins_lock:
-                if chatgpt_logins.get(chat_id) is not process:
-                    return
+            error_output = process.stderr.read()
+            if not release_login():
+                return
             if exit_code == 0 and chatgpt_connected(chat_id):
                 send_message(chat_id, "✅ ChatGPT подключён. Напишите, какой пост подготовить, или отправьте /post с темой.")
             else:
-                prompt_chatgpt(chat_id, "Подключение не завершилось. Попробуйте снова.\n\n")
+                prompt_chatgpt(chat_id, chatgpt_login_error(error_output) + "\n\n")
         except (ValueError, KeyError, OSError, TelegramError, subprocess.TimeoutExpired):
-            with chatgpt_logins_lock:
-                if chatgpt_logins.get(chat_id) is not process:
-                    return
+            stop_process()
+            error_output = ""
+            if process.stderr:
+                try:
+                    error_output = process.stderr.read()
+                except OSError:
+                    pass
+            if not release_login():
+                return
             try:
-                prompt_chatgpt(chat_id, "Не удалось завершить подключение. Попробуйте снова.\n\n")
+                prompt_chatgpt(chat_id, chatgpt_login_error(error_output) + "\n\n")
             except TelegramError:
                 pass
         finally:
-            if process.poll() is None:
-                process.terminate()
-            process.wait()
-            process.stdout.close()
-            with chatgpt_logins_lock:
-                if chatgpt_logins.get(chat_id) is process:
-                    chatgpt_logins.pop(chat_id, None)
+            stop_process()
+            for stream in (process.stdout, process.stderr):
+                if stream:
+                    stream.close()
+            release_login()
 
     threading.Thread(target=finish_login, daemon=True).start()
 
@@ -531,16 +576,18 @@ def request_text(chat_id: str, instructions: str, prompt: str) -> str:
 
 
 def post_body(answer: str) -> str | None:
-    marker, _, body = answer.partition("\n")
-    body = body.strip()
-    if marker.strip() == "ПОСТ" and body and text_length(body) <= 900 and not is_clarification(body) and not any(is_clarification(p, short_question=False) for p in re.split(r"\n\s*\n", body)):
+    body = re.sub(r"^```(?:text)?\s*|\s*```$", "", answer.strip(), flags=re.IGNORECASE)
+    body = re.sub(r"^(?:ПОСТ|ГОТОВЫЙ ПОСТ)\s*:?[ \t]*\n?", "", body, count=1, flags=re.IGNORECASE).strip()
+    body = re.sub(r"^(?:Конечно[!,.:]?\s*(?:вот\s+)?(?:готовый\s+)?пост[:.]?\s*|Вот готовый пост[:.]?\s*)", "", body, count=1, flags=re.IGNORECASE)
+    if body and text_length(body) <= 900 and not is_clarification(body) and not any(is_clarification(p, short_question=False) for p in re.split(r"\n\s*\n", body)):
         return body
     return None
 
 
 def openai_text(chat_id: str, user_text: str, extra: str = "", *, post: bool = False) -> str:
     profile = workspaces[chat_id]["profile"]
-    history = state["chats"].setdefault(str(chat_id), [])[-8:]
+    saved_history = state["chats"].setdefault(str(chat_id), [])
+    history = [] if post else saved_history[-8:]
     transcript = "\n".join(f"{item['role']}: {item['text']}" for item in history)
     task = (
         "Напиши готовый пост для Telegram как редактор, которому интересна сама тема. "
@@ -573,8 +620,8 @@ def openai_text(chat_id: str, user_text: str, extra: str = "", *, post: bool = F
             answer = post_body(request_text(chat_id, retry, prompt))
         if answer is None:
             raise SetupError("Модель не вернула готовый пост. Попробуйте повторить запрос.")
-    history.extend([{"role": "user", "text": user_text}, {"role": "assistant", "text": answer}])
-    state["chats"][str(chat_id)] = history[-16:]
+    saved_history.extend([{"role": "user", "text": user_text}, {"role": "assistant", "text": answer}])
+    state["chats"][str(chat_id)] = saved_history[-16:]
     write_json(STATE_FILE, state)
     return answer
 
@@ -1331,11 +1378,19 @@ def handle_callback(query: dict):
         except SetupError as exc:
             send_message(chat_id, str(exc))
             return
-        send_message(chat_id, "⏳ Одобрение принято. Отправляю пост в канал и сообщу результат.")
+        threading.Thread(
+            target=send_message,
+            args=(chat_id, "⏳ Одобрение принято. Отправляю пост в канал и сообщу результат."),
+            daemon=True,
+        ).start()
 
 
 def start_publish_job(chat_id: str, draft_id: str, notify_user=False):
     with bot_state_lock:
+        cutoff = time.time() - 6 * 3600
+        for old_job_id, old_job in list(publish_jobs.items()):
+            if old_job.get("created_at", 0) < cutoff and old_job.get("status") in ("done", "failed"):
+                publish_jobs.pop(old_job_id, None)
         draft = state.get("drafts", {}).get(draft_id)
         workspace = workspaces.get(chat_id)
         if not workspace or not draft or draft.get("chat_id") != chat_id:
@@ -1585,6 +1640,7 @@ def main():
         except OSError:
             raise SystemExit("Этот бот уже запущен. Остановите предыдущий процесс через Ctrl+C.")
         recover_pending_state()
+        recover_abandoned_publications()
         migrate_profiles()
         run_bot()
 

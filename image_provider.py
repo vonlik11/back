@@ -13,6 +13,11 @@ class ImageError(Exception):
     pass
 
 
+def configured_model():
+    model = os.getenv("OPENAI_IMAGE_MODEL", "").strip() or "gpt-image-2.5-flare"
+    return "gpt-image-2.5-flare" if model in ("gpt-image-1", "gpt-image-1.5") else model
+
+
 def configured(user_id=None):
     if os.getenv("OPENAI_API_KEY", "").strip():
         return True
@@ -26,15 +31,20 @@ def configured(user_id=None):
 
 
 def generate_with_user_key(prompt, user_id):
-    result = subprocess.run(
-        ["node", "siwc.mjs", "image-api", str(user_id)],
-        cwd=Path(__file__).resolve().parent,
-        input=json.dumps({"prompt": prompt, "safetyIdentifier": hashlib.sha256(f"ai-marketolog:{user_id}".encode()).hexdigest()}),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=190,
-    )
+    try:
+        result = subprocess.run(
+            ["node", "siwc.mjs", "image-api", str(user_id)],
+            cwd=Path(__file__).resolve().parent,
+            input=json.dumps({"prompt": prompt, "safetyIdentifier": hashlib.sha256(f"ai-marketolog:{user_id}".encode()).hexdigest()}),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=190,
+        )
+    except subprocess.TimeoutExpired:
+        raise ImageError("Генерация изображения превысила лимит времени. Черновик сохранён; попробуйте ещё раз или выберите фото из интернета.") from None
+    except OSError:
+        raise ImageError("Не удалось запустить генератор изображений. Проверьте установку Node.js и повторите позже.") from None
     if result.returncode:
         code = result.stderr.strip()
         messages = {
@@ -57,13 +67,10 @@ def generate_image(prompt, user_id):
     key = os.getenv("OPENAI_API_KEY", "").strip()
     if not key:
         if configured(user_id):
-            try:
-                return generate_with_user_key(prompt, user_id)
-            except subprocess.TimeoutExpired:
-                raise ImageError("Генерация изображения превысила лимит времени. Черновик сохранён; попробуйте ещё раз или выберите фото из интернета.") from None
+            return generate_with_user_key(prompt, user_id)
         raise ImageError("Для генерации изображения подключите OpenAI API через /api. Поиск лицензированных фото работает без API-ключа.")
     payload = {
-        "model": os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2.5-flare"),
+        "model": configured_model(),
         "prompt": prompt,
         "n": 1,
         "size": "1024x1024",
@@ -84,6 +91,7 @@ def generate_image(prompt, user_id):
         messages = {
             401: "Ключ сервиса изображений недействителен. Владельцу нужно проверить OPENAI_API_KEY.",
             403: "У API-аккаунта нет доступа к выбранной модели изображений. Проверьте доступ и верификацию организации.",
+            402: "На API-проекте нет доступного баланса. Пополните баланс или выберите фото из интернета.",
             429: "Лимит сервиса изображений исчерпан. Проверьте баланс API или попробуйте позже.",
         }
         raise ImageError(messages.get(exc.code, f"Сервис изображений отклонил запрос (HTTP {exc.code}). Попробуйте изменить описание или повторить позже.")) from None

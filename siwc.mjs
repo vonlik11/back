@@ -112,6 +112,17 @@ async function postForm(data) {
   return body;
 }
 
+function loginFailureCode(error) {
+  const message = String(error?.message || "");
+  if (/invalid_grant/i.test(message)) return "invalid_grant";
+  if (/access_denied/i.test(message)) return "access_denied";
+  if (/ChatGPT-план не разрешён|не разрешает использование плана/i.test(message)) return "permission_missing";
+  if (/Windows DPAPI|защищённого хранилища|защитить сессию/i.test(message)) return "secure_storage";
+  if (/client_id|регистрац|registration/i.test(message)) return "registration";
+  if (/fetch failed|network|ECONN|timeout|aborted/i.test(message)) return "network";
+  return "oauth_failed";
+}
+
 async function login(forceNewRegistration = false, telegram = false) {
   if (forceNewRegistration && fs.existsSync(credFile)) throw new Error("Уже есть подключённый ChatGPT-аккаунт. Сначала используйте обычный `npm run login`, чтобы не перезаписать его.");
   if (!telegram && fs.existsSync(credFile)) console.log("Существующее подключение будет заменено после успешной повторной авторизации.");
@@ -125,6 +136,13 @@ async function login(forceNewRegistration = false, telegram = false) {
   const clientId = existing?.clientId || pendingRegistration?.clientId || "dynamic_agent_client";
   let callback;
   let consumed = false;
+  const finishCallback = (res, status, body, headers = {}) => {
+    res.writeHead(status, { "content-type": "text/html; charset=utf-8", ...headers });
+    res.end(body, () => {
+      server.close();
+      server.closeAllConnections?.();
+    });
+  };
   const server = http.createServer(async (req, res) => {
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("Referrer-Policy", "no-referrer");
@@ -132,10 +150,22 @@ async function login(forceNewRegistration = false, telegram = false) {
     if (req.method !== "GET" || url.pathname !== "/auth/callback") { res.writeHead(404).end("Not found"); return; }
     if (consumed || url.searchParams.get("state") !== state) { res.writeHead(400).end("State validation failed"); return; }
     consumed = true;
-    if (url.searchParams.get("error")) { res.writeHead(400, { "content-type": "text/html; charset=utf-8" }).end("<h2>Вход не завершён. Закройте вкладку и повторите подключение.</h2>"); process.exitCode = 1; server.close(); return; }
+    if (url.searchParams.get("error")) {
+      const error = url.searchParams.get("error");
+      process.exitCode = 1;
+      const failure = error === "access_denied" ? "access_denied" : "oauth_failed";
+      finishCallback(res, 400, `<meta charset='utf-8'><h2>Вход не завершён</h2><p>Вернитесь в Telegram. Там появится причина и кнопка для повторного подключения.</p>`, { "x-chatgpt-login-error": failure });
+      if (telegram) console.error(`oauth_error:${failure}`);
+      return;
+    }
     const code = url.searchParams.get("code");
     const returnedClientId = url.searchParams.get("client_id") || pendingRegistration?.clientId || existing?.clientId;
-    if (!code || !returnedClientId || returnedClientId === "dynamic_agent_client") { res.writeHead(400).end("OpenAI не вернул данные для подключения."); process.exitCode = 1; server.close(); return; }
+    if (!code || !returnedClientId || returnedClientId === "dynamic_agent_client") {
+      process.exitCode = 1;
+      finishCallback(res, 400, "OpenAI не вернул данные для подключения.", { "x-chatgpt-login-error": "registration" });
+      if (telegram) console.error("oauth_error:registration");
+      return;
+    }
     try {
       if (clientId !== "dynamic_agent_client" && returnedClientId !== clientId) throw new Error("OpenAI вернул другой client_id, чем сохранённая регистрация.");
       fs.mkdirSync(authDir, { recursive: true });
@@ -148,13 +178,15 @@ async function login(forceNewRegistration = false, telegram = false) {
       saveCredentials(credentials);
       if (telegram) writePrivateFile(providerFile, "chatgpt");
       fs.rmSync(registrationFile, { force: true });
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end("<meta charset='utf-8'><h2>ChatGPT подключён ✅</h2><p>Можно закрыть эту вкладку и вернуться в Telegram.</p>");
+      finishCallback(res, 200, "<meta charset='utf-8'><h2>ChatGPT подключён ✅</h2><p>Можно закрыть эту вкладку и вернуться в Telegram.</p>");
       if (!telegram) console.log("ChatGPT подключён. Разрешение на использование плана получено.");
     } catch (error) {
-      res.writeHead(400, { "content-type": "text/html; charset=utf-8" }).end("<meta charset='utf-8'><h2>Не удалось завершить подключение</h2><p>Вернитесь в приложение и повторите подключение.</p>");
-      if (!telegram) console.error(error.message);
+      const failure = loginFailureCode(error);
+      finishCallback(res, 400, "<meta charset='utf-8'><h2>Не удалось завершить подключение</h2><p>Вернитесь в Telegram. Там появится причина и кнопка для повторного подключения.</p>", { "x-chatgpt-login-error": failure });
+      if (telegram) console.error(`oauth_error:${failure}`);
+      else console.error(error.message);
       process.exitCode = 1;
-    } finally { server.close(); }
+    }
   });
   await new Promise((resolve, reject) => server.once("error", reject).listen(telegram ? 0 : 1455, "127.0.0.1", resolve));
   callback = `http://127.0.0.1:${server.address().port}/auth/callback`;
@@ -163,6 +195,7 @@ async function login(forceNewRegistration = false, telegram = false) {
     if (consumed) return;
     process.exitCode = 1;
     server.close();
+    server.closeAllConnections?.();
   }, 10 * 60 * 1000);
   const params = new URLSearchParams({ client_id: clientId, ext_agent_host_id: hostId, response_type: "code", redirect_uri: callback, scope: "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct", resource, state, nonce, code_challenge_method: "S256", code_challenge: challenge });
   if (clientId === "dynamic_agent_client") params.set("agent_name_hint", "AI-маркетолог");
@@ -199,6 +232,8 @@ async function getAccessToken() {
 
 const chatgptModel = process.env.CHATGPT_MODEL || "gpt-6.1-sol";
 const apiModel = process.env.OPENAI_API_MODEL || "gpt-5.4-mini";
+const requestedImageModel = process.env.OPENAI_IMAGE_MODEL || "gpt-image-2.5-flare";
+const imageModel = ["gpt-image-1", "gpt-image-1.5"].includes(requestedImageModel) ? "gpt-image-2.5-flare" : requestedImageModel;
 
 async function connectApiKey(apiKey) {
   if (!telegramId || typeof apiKey !== "string" || !/^sk-[A-Za-z0-9_-]{16,500}$/.test(apiKey) || apiKey.startsWith("sk-admin-")) {
@@ -255,7 +290,7 @@ async function generateImageWithApiKey(payload) {
     method: "POST",
     headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
     body: JSON.stringify({
-      model: process.env.OPENAI_IMAGE_MODEL || "gpt-image-2.5-flare",
+      model: imageModel,
       prompt: payload.prompt,
       size: "1024x1024",
       quality: "medium",
