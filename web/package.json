@@ -1,0 +1,12 @@
+{
+  "name": "ai-marketer-miniapp",
+  "version": "1.0.0",
+  "description": "Telegram Mini App frontend for Autonomous AI-Marketer",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": ["telegram-mini-app", "ai-marketer"],
+  "author": "",
+  "license": "MIT"
+}
