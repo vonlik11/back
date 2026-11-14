@@ -42,6 +42,18 @@ def load_dotenv() -> None:
 
 
 load_dotenv()
+
+
+def node_command() -> str:
+    configured = os.getenv("NODE_EXECUTABLE")
+    candidate = configured or shutil.which("node") or shutil.which("node.exe")
+    if candidate:
+        return candidate
+    if os.name == "nt":
+        for candidate in (r"C:\Program Files\nodejs\node.exe", os.path.expandvars(r"%LOCALAPPDATA%\Programs\nodejs\node.exe")):
+            if candidate and Path(candidate).is_file():
+                return candidate
+    raise RuntimeError("Node.js не найден. Установите Node.js 22.12+ или укажите NODE_EXECUTABLE в .env.")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")
 ADMIN_CHAT_ID = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "")
@@ -55,7 +67,12 @@ DAILY_USER_IMAGE_LIMIT = int(os.getenv("DAILY_USER_IMAGE_LIMIT", "3"))
 BOT_ID = None
 chatgpt_logins = {}
 chatgpt_logins_lock = threading.Lock()
-api_key_requests = set()
+API_PROVIDERS = {
+    "openai": ("OpenAI API", "https://platform.openai.com/api-keys"),
+    "gemini": ("Google Gemini", "https://aistudio.google.com/app/apikey"),
+    "claude": ("Anthropic Claude", "https://console.anthropic.com/settings/keys"),
+    "deepseek": ("DeepSeek", "https://platform.deepseek.com/api_keys"),
+}
 reset_requests = {}
 
 
@@ -257,6 +274,8 @@ def register_bot_commands():
         {"command": "profile", "description": "Профиль компании"},
         {"command": "analytics", "description": "Публикации и реакции"},
         {"command": "schedule", "description": "Расписание черновиков"},
+        {"command": "api", "description": "Подключить AI API"},
+        {"command": "chatgpt", "description": "Подключить ChatGPT"},
         {"command": "help", "description": "Как пользоваться ботом"},
     ]})
 
@@ -280,7 +299,7 @@ def ai_provider(chat_id: str) -> str | None:
 
 def account_buttons():
     return [
-        [{"text": "Подключить OpenAI API", "callback_data": "connect_api"}],
+        [{"text": "Подключить API: OpenAI / Gemini / Claude / DeepSeek", "callback_data": "connect_api"}],
         [{"text": "Сбросить аккаунт", "callback_data": "reset_account"}],
     ]
 
@@ -290,7 +309,7 @@ def prompt_chatgpt(chat_id: str, prefix: str = ""):
         [{"text": "Подключить ChatGPT", "callback_data": "connect_chatgpt"}],
         *account_buttons(),
     ]}
-    send_message(chat_id, prefix + "Выберите, как подключить генерацию постов. Вход в ChatGPT проходит в браузере на компьютере с ботом. Ключ OpenAI API можно подключить с телефона.", markup)
+    send_message(chat_id, prefix + "Выберите, как подключить генерацию постов. Вход ChatGPT и API-ключи подключаются через браузер на компьютере с ботом.", markup)
 
 
 def request_account_reset(chat_id: str):
@@ -300,7 +319,7 @@ def request_account_reset(chat_id: str):
         {"text": "Да, сбросить", "callback_data": f"reset_confirm:{token}"},
         {"text": "Отмена", "callback_data": f"reset_cancel:{token}"},
     ]]}
-    send_message(chat_id, "Сброс удалит профиль, черновики, аналитику и сохранённые подключения к ChatGPT и OpenAI API. Уже опубликованные посты останутся в канале. Подтвердите сброс, если хотите зарегистрироваться заново.", markup)
+    send_message(chat_id, "Сброс удалит профиль, черновики, аналитику и сохранённые подключения ChatGPT и AI API. Уже опубликованные посты останутся в канале. Подтвердите сброс, если хотите зарегистрироваться заново.", markup)
 
 
 def reset_account(chat_id: str):
@@ -308,7 +327,6 @@ def reset_account(chat_id: str):
     auth_dir = auth_root / chat_id
     if not re.fullmatch(r"[1-9][0-9]{0,15}", chat_id) or auth_dir.resolve() != auth_dir or not auth_dir.is_relative_to(ROOT):
         raise SetupError("Не удалось безопасно удалить сохранённое подключение.")
-    api_key_requests.discard(chat_id)
     with chatgpt_logins_lock:
         process = chatgpt_logins.get(chat_id)
         if process and process.poll() is None:
@@ -345,54 +363,79 @@ def start_api_login(chat_id: str):
     if active:
         send_message(chat_id, "Завершите вход в ChatGPT или дождитесь окончания срока ссылки, затем повторите /api.")
         return
-    markup = {"inline_keyboard": [[{"text": "Создать ключ OpenAI", "url": "https://platform.openai.com/api-keys"}]]}
-    send_message(chat_id, "Создайте ключ проекта OpenAI и отправьте его одним сообщением в этот личный чат. Бот удалит сообщение перед проверкой ключа. Отмена — /cancel.", markup)
-    api_key_requests.add(chat_id)
+    providers = [
+        [{"text": "OpenAI API", "callback_data": "api_provider:openai"}, {"text": "Gemini API", "callback_data": "api_provider:gemini"}],
+        [{"text": "Claude API", "callback_data": "api_provider:claude"}, {"text": "DeepSeek API", "callback_data": "api_provider:deepseek"}],
+    ]
+    send_message(chat_id, "Выберите API-провайдера. Подключённый API заменит текущий способ генерации текста.", {"inline_keyboard": providers})
+
+
+def request_provider_key(chat_id: str, provider: str):
+    if provider not in API_PROVIDERS:
+        send_message(chat_id, "Неизвестный API-провайдер. Выполните /api и выберите его из списка.")
+        return
+    with chatgpt_logins_lock:
+        if chat_id in chatgpt_logins:
+            send_message(chat_id, "Сначала завершите уже начатое подключение ChatGPT или API.")
+            return
+        try:
+            process = subprocess.Popen(
+                [node_command(), "siwc.mjs", "api-login", chat_id, provider], cwd=ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+            )
+        except (OSError, RuntimeError):
+            send_message(chat_id, "Не удалось запустить подключение API. Проверьте установку Node.js и npm install.")
+            return
+        chatgpt_logins[chat_id] = process
+
+    def finish_api_login():
+        try:
+            info = json.loads(process.stdout.readline())
+            send_message(chat_id,
+                f"Откройте локальную страницу на компьютере с ботом и введите там ключ {API_PROVIDERS[provider][0]}. "
+                "Ключ не отправляйте в Telegram. Ссылка действует 10 минут.",
+                {"inline_keyboard": [[{"text": "Открыть форму подключения", "url": info["url"]}]]})
+            code = process.wait(timeout=660)
+            with chatgpt_logins_lock:
+                if chatgpt_logins.get(chat_id) is not process:
+                    return
+            if code == 0:
+                send_main_menu(chat_id, f"✅ {API_PROVIDERS[provider][0]} подключён. Теперь можно создать черновик.")
+            else:
+                send_message(chat_id, "Подключение API не завершилось. Проверьте ключ и модель, затем повторите /api.")
+        except (ValueError, KeyError, OSError, TelegramError, subprocess.TimeoutExpired):
+            with chatgpt_logins_lock:
+                still_active = chatgpt_logins.get(chat_id) is process
+            if still_active:
+                send_message(chat_id, "Не удалось завершить подключение API. Повторите /api.")
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.wait()
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
+            with chatgpt_logins_lock:
+                if chatgpt_logins.get(chat_id) is process:
+                    chatgpt_logins.pop(chat_id, None)
+
+    threading.Thread(target=finish_api_login, daemon=True).start()
 
 
 def api_error(code: str) -> str:
     if code in ("invalid_key", "api_http_401"):
-        return "OpenAI отклонил ключ. Создайте новый ключ проекта и попробуйте снова."
-    if code in ("api_http_403", "api_http_404"):
-        return "У ключа нет доступа к нужной модели или операции. Проверьте права ключа и доступ к модели в проекте OpenAI."
+        return "Провайдер отклонил ключ. Создайте новый API-ключ и попробуйте снова."
+    if code == "api_http_403":
+        return "Ключу запрещён доступ к модели или API. Проверьте права проекта и доступность сервиса в вашем регионе."
+    if code == "api_http_404":
+        return "Настроенная модель не найдена или недоступна этому ключу. Проверьте имя модели в .env."
     if code in ("api_http_402", "api_http_429"):
-        return "OpenAI API ограничил запрос. Проверьте баланс и лимиты проекта на platform.openai.com."
-    return "OpenAI API сейчас недоступен. Повторите запрос через некоторое время."
-
-
-def connect_api_key(chat_id: str, key: str, message_id):
-    if not re.search(r"\bsk-[A-Za-z0-9_-]{16,500}", key):
-        send_message(chat_id, "Нужен ключ проекта OpenAI, начинающийся с sk-. Пришлите ключ отдельным сообщением или отправьте /cancel.")
-        return
-    if message_id is None:
-        return
-    try:
-        tg("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
-    except (TelegramError, TimeoutError):
-        send_message(chat_id, "Не удалось удалить сообщение. Удалите его и отправьте новый ключ через /api.")
-        api_key_requests.discard(chat_id)
-        return
-    if not re.fullmatch(r"sk-[A-Za-z0-9_-]{16,500}", key) or key.startswith("sk-admin-"):
-        send_message(chat_id, "Нужен ключ проекта OpenAI, начинающийся с sk-. Пришлите ключ отдельным сообщением или отправьте /cancel.")
-        return
-    try:
-        result = subprocess.run(
-            ["node", "siwc.mjs", "connect-api", chat_id], cwd=ROOT,
-            input=json.dumps({"apiKey": key}), capture_output=True,
-            text=True, encoding="utf-8", timeout=50,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        send_message(chat_id, api_error(""))
-        return
-    if result.returncode:
-        send_message(chat_id, api_error(result.stderr.strip()) + " Пришлите ключ ещё раз или отправьте /cancel.")
-        return
-    api_key_requests.discard(chat_id)
-    send_main_menu(chat_id, "✅ OpenAI API подключён. Следующие запросы пойдут через ваш проект OpenAI. Выберите действие ниже или напишите задачу сообщением.")
+        return "Провайдер отклонил запрос из-за баланса или лимита. Проверьте оплату и лимиты API-аккаунта."
+    return "API-провайдер сейчас недоступен. Проверьте ключ, модель и соединение, затем повторите."
 
 
 def start_chatgpt_login(chat_id: str):
-    api_key_requests.discard(chat_id)
     with chatgpt_logins_lock:
         active = chatgpt_logins.get(chat_id)
         if active:
@@ -400,11 +443,11 @@ def start_chatgpt_login(chat_id: str):
             return
         try:
             process = subprocess.Popen(
-                ["node", "siwc.mjs", "login-telegram", chat_id], cwd=ROOT,
+                [node_command(), "siwc.mjs", "login-telegram", chat_id], cwd=ROOT,
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 text=True, encoding="utf-8",
             )
-        except OSError:
+        except (OSError, RuntimeError):
             send_message(chat_id, "Не удалось запустить подключение ChatGPT. Попробуйте позже.")
             return
         chatgpt_logins[chat_id] = process
@@ -422,7 +465,7 @@ def start_chatgpt_login(chat_id: str):
             if exit_code == 0 and chatgpt_connected(chat_id):
                 send_main_menu(chat_id, "✅ ChatGPT подключён. Выберите действие ниже или напишите задачу сообщением.")
             else:
-                prompt_chatgpt(chat_id, "Подключение не завершилось. Попробуйте снова.\n\n")
+                prompt_chatgpt(chat_id, "Подключение ChatGPT не завершилось. Если OpenAI сообщает о неподдерживаемом регионе, это ограничение сервиса; попробуйте подключить Gemini, Claude или DeepSeek через /api.\n\n")
         except (ValueError, KeyError, OSError, TelegramError, subprocess.TimeoutExpired):
             with chatgpt_logins_lock:
                 if chatgpt_logins.get(chat_id) is not process:
@@ -489,7 +532,7 @@ def request_text(chat_id: str, instructions: str, prompt: str) -> str:
             raise SetupError("Завершите подключение ChatGPT в браузере и повторите запрос.")
     provider = ai_provider(chat_id)
     if provider is None:
-        raise SetupError("Для генерации подключите ChatGPT через /chatgpt или OpenAI API через /api.")
+        raise SetupError("Для генерации подключите ChatGPT через /chatgpt или AI API через /api.")
     today = bot_time().date().isoformat()
     usage = state.setdefault("usage", {})
     if usage.get("date") != today:
@@ -516,7 +559,7 @@ def request_text(chat_id: str, instructions: str, prompt: str) -> str:
     typing.start()
     try:
         request = subprocess.run(
-            ["node", "siwc.mjs", "infer-api" if provider == "api" else "infer", chat_id], cwd=ROOT,
+            [node_command(), "siwc.mjs", "infer-api" if provider == "api" else "infer", chat_id], cwd=ROOT,
             input=json.dumps({"prompt": prompt, "instructions": instructions}, ensure_ascii=False),
             capture_output=True, text=True, encoding="utf-8", timeout=120,
         )
@@ -861,7 +904,6 @@ def check_channel(channel: str, chat_id: str) -> dict:
 
 
 def start_setup(chat_id: str, sender: dict | None = None):
-    api_key_requests.discard(chat_id)
     workspace = workspaces.get(chat_id, {})
     registered = workspace.get("registration", {})
     account = user_database.get(chat_id) or {}
@@ -995,12 +1037,9 @@ def handle_message(message: dict):
     text = (message.get("text") or message.get("caption") or "").strip()
     if not chat_id:
         return
-    if re.search(r"\bsk-[A-Za-z0-9_-]{16,500}", text):
-        if chat_id in api_key_requests and (message.get("text") or "").strip() == text:
-            connect_api_key(chat_id, text, message.get("message_id"))
-        else:
-            delete_private_message(chat_id, message.get("message_id"))
-            send_message(chat_id, "Для подключения ключа сначала отправьте /api, затем пришлите ключ отдельным сообщением.")
+    if re.search(r"\b(?:sk-[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{20,})", text):
+        delete_private_message(chat_id, message.get("message_id"))
+        send_message(chat_id, "Не отправляйте API-ключ в чат. Подключите его через /api и откройте локальную форму на компьютере с ботом.")
         return
     upload = None
     photos = message.get("photo") or []
@@ -1042,7 +1081,12 @@ def handle_message(message: dict):
         if not (workspace or {}).get("registration") or chat_id in state.get("setup", {}):
             send_message(chat_id, "Сначала завершите регистрацию или изменение профиля.")
         elif command == "/api":
-            start_api_login(chat_id)
+            parts = text.split(maxsplit=1)
+            provider = parts[1].strip().casefold() if len(parts) == 2 else ""
+            if provider in {"openai", "gemini", "claude", "deepseek"}:
+                request_provider_key(chat_id, provider)
+            else:
+                start_api_login(chat_id)
         else:
             prompt_chatgpt(chat_id)
         return
@@ -1060,7 +1104,6 @@ def handle_message(message: dict):
         start_setup(chat_id, message.get("from"))
         return
     if command == "/cancel":
-        api_key_requests.discard(chat_id)
         reset_requests.pop(chat_id, None)
         state.setdefault("setup", {}).pop(chat_id, None)
         state.setdefault("uploads", {}).pop(chat_id, None)
@@ -1140,10 +1183,6 @@ def handle_message(message: dict):
             )
             lines.append(f"{day} · {post['reaction_total']} реакций{(': ' + reactions) if reactions else ''}\n{post['text_preview']}")
         send_message(chat_id, "\n".join(lines))
-        return
-    if chat_id in api_key_requests and not command:
-        if not upload:
-            connect_api_key(chat_id, text, message.get("message_id"))
         return
     if command and command not in ("/post", "/image", "/findimage"):
         send_message(chat_id, "Доступные команды — /help.")
@@ -1259,6 +1298,12 @@ def handle_callback(query: dict):
     if data == "connect_api":
         if (workspaces.get(chat_id) or {}).get("registration") and chat_id not in state.get("setup", {}):
             start_api_login(chat_id)
+        else:
+            send_message(chat_id, "Сначала завершите регистрацию или изменение профиля.")
+        return
+    if data.startswith("api_provider:"):
+        if (workspaces.get(chat_id) or {}).get("registration") and chat_id not in state.get("setup", {}):
+            request_provider_key(chat_id, data.partition(":")[2])
         else:
             send_message(chat_id, "Сначала завершите регистрацию или изменение профиля.")
         return

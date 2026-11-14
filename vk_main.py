@@ -85,6 +85,14 @@ state.setdefault("schedule", None)
 state.setdefault("schedule_runs", {})
 state.setdefault("ai_usage", {})
 state.setdefault("image_usage", {})
+auth_logins = {}
+AUTH_LOGIN_LOCK = threading.Lock()
+API_PROVIDERS = {
+    "openai": ("OpenAI API", "https://platform.openai.com/api-keys"),
+    "gemini": ("Google Gemini API", "https://aistudio.google.com/app/apikey"),
+    "claude": ("Anthropic Claude API", "https://console.anthropic.com/settings/keys"),
+    "deepseek": ("DeepSeek API", "https://platform.deepseek.com/api_keys"),
+}
 if state.get("draft") and not state["drafts"]:
     legacy = dict(state["draft"])
     legacy.setdefault("id", uuid.uuid4().hex[:12])
@@ -133,6 +141,7 @@ def main_keyboard() -> str:
     labels = [
         ("✍️ Создать пост", "primary"), ("👤 Профиль", "secondary"),
         ("📊 Публикации", "secondary"), ("⏰ Расписание", "secondary"),
+        ("🔑 AI API", "secondary"),
         ("❓ Помощь", "secondary"),
     ]
     buttons = []
@@ -163,7 +172,16 @@ def auth_path(user_id: str) -> Path:
 
 
 def chatgpt_connected(user_id: str) -> bool:
-    return auth_path(user_id).is_file()
+    return auth_path(user_id).is_file() or (auth_path(user_id).parent / "api-key.enc").is_file()
+
+
+def ai_provider(user_id: str) -> str:
+    path = auth_path(user_id).parent
+    try:
+        provider = (path / "provider").read_text(encoding="utf-8").strip()
+        return provider if provider in {"chatgpt", "api"} else "chatgpt"
+    except OSError:
+        return "api" if (path / "api-key.enc").is_file() else "chatgpt"
 
 
 def local_date() -> str:
@@ -185,8 +203,9 @@ def reserve_usage(field: str, limit: int) -> None:
 def ai_text(user_id: str, prompt: str, instructions: str, *, reserve=True) -> str:
     if reserve:
         reserve_usage("ai_usage", DAILY_AI_LIMIT)
+    provider = ai_provider(user_id)
     result = subprocess.run(
-        [node_command(), "siwc.mjs", "infer-vk", user_id], cwd=ROOT,
+        [node_command(), "siwc.mjs", "infer-api-vk" if provider == "api" else "infer-vk", user_id], cwd=ROOT,
         input=json.dumps({"prompt": prompt, "instructions": instructions}, ensure_ascii=False),
         capture_output=True, text=True, encoding="utf-8", timeout=150,
     )
@@ -197,9 +216,15 @@ def ai_text(user_id: str, prompt: str, instructions: str, *, reserve=True) -> st
             "chatgpt_access_denied": "ChatGPT не разрешил запрос. Повторите вход командой /chatgpt и подтвердите доступ.",
             "chatgpt_model_unavailable": "Выбранная модель недоступна этой сессии. Проверьте CHATGPT_MODEL в .env.",
             "openai_network_error": "Не удалось соединиться с OpenAI. Проверьте интернет и повторите позже.",
+            "api_http_401": "API-провайдер отклонил ключ. Подключите новый через /api.",
+            "api_http_402": "Недостаточно средств на балансе API-провайдера.",
+            "api_http_403": "У API-ключа нет доступа к модели или запросу.",
+            "api_http_404": "Модель не найдена. Проверьте имя модели в настройках .env.",
+            "api_http_429": "Превышен лимит API-провайдера. Попробуйте позже или проверьте оплату.",
         }
         code = result.stderr.strip()
-        raise RuntimeError(messages.get(code, "ChatGPT не ответил. Повторите /chatgpt; если ошибка останется, пришлите полный текст ошибки."))
+        default = "API-провайдер не ответил. Проверьте ключ и повторите /api." if provider == "api" else "ChatGPT не ответил. Повторите /chatgpt; если ошибка останется, пришлите полный текст ошибки."
+        raise RuntimeError(messages.get(code, default))
     answer = json.loads(result.stdout).get("text", "").strip()
     if not answer:
         raise RuntimeError("Модель вернула пустой ответ.")
@@ -344,29 +369,65 @@ def edit_draft(peer_id: int, user_id: str, instruction: str):
 
 
 def start_chatgpt_login(peer_id: int, user_id: str):
-    try:
-        proc = subprocess.Popen([node_command(), "siwc.mjs", "login-vk", user_id], cwd=ROOT,
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8")
-        info = json.loads(proc.stdout.readline())
-        send(peer_id, f"Откройте ссылку, войдите в ChatGPT и разрешите подключение:\n{info['url']}\n\nСсылка действует около 10 минут.")
-    except Exception as exc:
+    start_login_process(peer_id, user_id, "chatgpt")
+
+
+def start_api_login(peer_id: int, user_id: str, provider: str | None = None):
+    if provider not in API_PROVIDERS:
+        buttons = []
+        for key, (name, _) in API_PROVIDERS.items():
+            buttons.append([{"action": {"type": "text", "label": f"/api {key}"}, "color": "secondary"}])
+        keyboard = json.dumps({"one_time": True, "buttons": buttons}, ensure_ascii=False)
+        send(peer_id, "Выберите API-провайдера. Ключ вводится в локальной форме на компьютере с ботом.", keyboard=keyboard)
+        return
+    start_login_process(peer_id, user_id, "api", provider)
+
+
+def start_login_process(peer_id: int, user_id: str, kind: str, provider: str | None = None):
+    with AUTH_LOGIN_LOCK:
+        if user_id in auth_logins:
+            send(peer_id, "Для аккаунта уже начат вход. Завершите его и повторите команду.")
+            return
+        command = "api-login-vk" if kind == "api" else "login-vk"
+        args = [node_command(), "siwc.mjs", command, user_id]
+        if provider:
+            args.append(provider)
         try:
-            proc.terminate()
-        except Exception:
-            pass
-        send(peer_id, f"Не удалось начать вход в ChatGPT: {str(exc)[:220]}")
+            proc = subprocess.Popen(args, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    text=True, encoding="utf-8")
+        except (OSError, RuntimeError) as exc:
+            send(peer_id, f"Не удалось запустить вход: {str(exc)[:220]}")
+            return
+        auth_logins[user_id] = proc
+    try:
+        info = json.loads(proc.stdout.readline())
+        if kind == "api":
+            name = API_PROVIDERS[provider][0]
+            send(peer_id, f"Откройте локальную страницу на компьютере с ботом и введите там ключ {name}. Ключ не отправляйте в VK. Ссылка действует 10 минут:\n{info['url']}")
+        else:
+            send(peer_id, f"Откройте ссылку, войдите в ChatGPT и разрешите подключение:\n{info['url']}\n\nСсылка действует около 10 минут.")
+    except Exception as exc:
+        proc.terminate()
+        with AUTH_LOGIN_LOCK:
+            auth_logins.pop(user_id, None)
+        send(peer_id, f"Не удалось начать вход. Проверьте Node.js и npm install: {str(exc)[:180]}")
         return
 
     def finish():
         try:
             code = proc.wait(timeout=660)
-            if code == 0 and chatgpt_connected(user_id):
-                send_menu(peer_id, "✅ ChatGPT подключён. Выберите действие или напишите тему поста.")
-            else:
-                send(peer_id, "Вход не завершился. Повторите /chatgpt.")
+            name = API_PROVIDERS[provider][0] if provider else "ChatGPT"
+            message = f"✅ {name} подключён. Выберите действие или напишите тему поста." if code == 0 else "Вход не завершился. Если OpenAI сообщает о неподдерживаемом регионе, это ограничение сервиса; попробуйте API через /api."
+            send_menu(peer_id, message)
         except subprocess.TimeoutExpired:
             proc.terminate()
-            send(peer_id, "Ссылка истекла. Для нового входа отправьте /chatgpt.")
+            send(peer_id, "Ссылка истекла. Для нового входа повторите команду подключения.")
+        finally:
+            if proc.stdout:
+                proc.stdout.close()
+            with AUTH_LOGIN_LOCK:
+                if auth_logins.get(user_id) is proc:
+                    auth_logins.pop(user_id, None)
     threading.Thread(target=finish, daemon=True).start()
 
 
@@ -434,6 +495,9 @@ def handle_message(message: dict):
     if not user_id or peer_id != int(user_id):
         return
     text = (message.get("text") or "").strip()
+    if re.search(r"\b(?:sk-[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{20,})", text):
+        send(peer_id, "API-ключ уже попал в историю VK. Удалите это сообщение вручную. Подключайте ключ через /api и вводите его только в локальной форме на компьютере с ботом.")
+        return
     if text == "/id":
         send(peer_id, f"Ваш VK user ID: {user_id}. Добавьте его в VK_ADMIN_USER_ID в .env.")
         return
@@ -442,17 +506,24 @@ def handle_message(message: dict):
         return
     command, _, argument = text.partition(" ")
     command = command.lower()
-    menu = {"✍️ Создать пост": "/post", "📊 Публикации": "/analytics", "⏰ Расписание": "/schedule", "❓ Помощь": "/help"}
+    menu = {"✍️ Создать пост": "/post", "📊 Публикации": "/analytics", "⏰ Расписание": "/schedule", "🔑 AI API": "/api", "❓ Помощь": "/help"}
     text = menu.get(text, text)
     command, _, argument = text.partition(" ")
     command = command.lower()
+    if command == "/chatgpt":
+        start_chatgpt_login(peer_id, user_id)
+        return
+    if command == "/api":
+        provider = argument.strip().casefold() if argument.strip() else None
+        start_api_login(peer_id, user_id, provider)
+        return
     if command in {"/start", "/help"}:
         if not state.get("company"):
             state["registration"] = {"step": "name"}
             save_state()
             send(peer_id, "Здравствуйте! Я AI-маркетолог вашего сообщества. Напишите название компании.")
         else:
-            send_menu(peer_id, "Главное меню\n\nНапишите задачу обычным сообщением или нажмите «Создать пост». Черновик появится здесь; публикация — только после вашего одобрения.\n\nКоманды: /profile, /chatgpt, /schedule, /analytics, /status, /reset.")
+            send_menu(peer_id, "Главное меню\n\nНапишите задачу обычным сообщением или нажмите «Создать пост». Черновик появится здесь; публикация — только после вашего одобрения.\n\nКоманды: /profile, /chatgpt, /api, /schedule, /analytics, /status, /reset.")
         return
     if state.get("registration") and command not in {"/cancel", "/help"}:
         handle_profile(peer_id, text)
@@ -465,14 +536,11 @@ def handle_message(message: dict):
     if command == "/profile":
         if state.get("company"):
             company = state["company"]
-            send(peer_id, f"Компания: {company.get('name', '—')}\nОписание: {company.get('description', '—')}\nChatGPT: {'подключён' if chatgpt_connected(user_id) else 'не подключён'}\n\nЧтобы изменить профиль, отправьте /company.")
+            send(peer_id, f"Компания: {company.get('name', '—')}\nОписание: {company.get('description', '—')}\nAI: {'подключён' if chatgpt_connected(user_id) else 'не подключён'}\n\nЧтобы изменить профиль, отправьте /company.")
         else:
             state["registration"] = {"step": "name"}
             save_state()
             send(peer_id, "Напишите название компании.")
-        return
-    if command == "/chatgpt":
-        start_chatgpt_login(peer_id, user_id)
         return
     if command == "/cancel":
         state["registration"] = {}
@@ -505,7 +573,7 @@ def handle_message(message: dict):
         state.update(company={}, registration={}, schedule=None, schedule_runs={})
         save_state()
         shutil.rmtree(ROOT / ".auth" / "vk" / user_id, ignore_errors=True)
-        send(peer_id, "Профиль и вход ChatGPT сброшены. Опубликованные посты не затронуты.")
+        send(peer_id, "Профиль и подключение AI сброшены. Опубликованные посты не затронуты.")
         return
     if text == "✅ Одобрить и опубликовать" or command == "/approve":
         publish(peer_id)
@@ -575,7 +643,7 @@ def handle_message(message: dict):
         return
     elif text in {"👤 Профиль"}:
         company = state.get("company", {})
-        send(peer_id, f"Компания: {company.get('name', '—')}\nОписание: {company.get('description', '—')}\nChatGPT: {'подключён' if chatgpt_connected(user_id) else 'не подключён'}\n\n/profile — изменить профиль")
+        send(peer_id, f"Компания: {company.get('name', '—')}\nОписание: {company.get('description', '—')}\nAI: {'подключён' if chatgpt_connected(user_id) else 'не подключён'}\n\n/profile — изменить профиль")
         return
     elif text in {"📊 Публикации"}:
         # Route through the regular command handler on the next message.

@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import threading
 import time
@@ -22,6 +23,8 @@ from web_images import WebImageError, search_images, download_image
 ROOT = Path(__file__).resolve().parent
 STATE_PATH = ROOT / "max_state.json"
 API_ROOT = "https://platform-api2.max.ru"
+API_FALLBACK_ROOT = "https://platform-api.max.ru"
+API_FALLBACK_NOTICE_SHOWN = False
 
 
 def node_command() -> str:
@@ -79,11 +82,22 @@ def request_json(url: str, method="GET", body=None, headers=None, timeout=45):
         raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
 
 
-def max_api(path: str, method="GET", params=None, body=None):
-    query = urllib.parse.urlencode(params or {})
-    url = f"{API_ROOT}{path}" + (f"?{query}" if query else "")
+def max_api(path: str, method="GET", params=None, body=None, *, timeout=45):
+    global API_FALLBACK_NOTICE_SHOWN
+    query = urllib.parse.urlencode(params or {}, doseq=True)
+    suffix = f"?{query}" if query else ""
+    url = f"{API_ROOT}{path}{suffix}"
     headers = {"Authorization": TOKEN, "Content-Type": "application/json"}
-    return request_json(url, method, body, headers)
+    try:
+        return request_json(url, method, body, headers, timeout=timeout)
+    except urllib.error.URLError as exc:
+        if not isinstance(exc.reason, (ssl.SSLError, TimeoutError)):
+            raise
+        if not API_FALLBACK_NOTICE_SHOWN:
+            print("MAX API: TLS к основному адресу оборвался; пробую резервный адрес с проверкой сертификата.")
+            API_FALLBACK_NOTICE_SHOWN = True
+        fallback_url = f"{API_FALLBACK_ROOT}{path}{suffix}"
+        return request_json(fallback_url, method, body, headers, timeout=timeout)
 
 
 def load_state():
@@ -104,6 +118,14 @@ state.setdefault("schedules", {})
 state.setdefault("schedule_runs", {})
 state.setdefault("ai_usage", {})
 state.setdefault("image_usage", {})
+auth_logins = {}
+AUTH_LOGIN_LOCK = threading.Lock()
+API_PROVIDERS = {
+    "openai": ("OpenAI API", "https://platform.openai.com/api-keys"),
+    "gemini": ("Google Gemini API", "https://aistudio.google.com/app/apikey"),
+    "claude": ("Anthropic Claude API", "https://console.anthropic.com/settings/keys"),
+    "deepseek": ("DeepSeek API", "https://platform.deepseek.com/api_keys"),
+}
 
 
 def save_state():
@@ -224,7 +246,17 @@ def ai_text(user_id: str, prompt: str, instructions: str, *, reserve=True) -> st
         capture_output=True, text=True, encoding="utf-8", timeout=150,
     )
     if result.returncode:
-        raise RuntimeError("AI не ответил. Переподключите аккаунт командой /chatgpt.")
+        code = result.stderr.strip()
+        if ai_provider(user_id) == "api":
+            messages = {
+                "api_http_401": "API-провайдер отклонил ключ. Подключите новый через /api.",
+                "api_http_402": "Недостаточно средств на балансе API-провайдера.",
+                "api_http_403": "У API-ключа нет доступа к модели или запросу.",
+                "api_http_404": "Модель не найдена. Проверьте имя модели в настройках .env.",
+                "api_http_429": "Превышен лимит API-провайдера. Попробуйте позже или проверьте оплату.",
+            }
+            raise RuntimeError(messages.get(code, "API-провайдер не ответил. Проверьте соединение и повторите запрос."))
+        raise RuntimeError("ChatGPT не ответил. Переподключите его командой /chatgpt.")
     text = json.loads(result.stdout).get("text", "").strip()
     if not text:
         raise RuntimeError("Модель вернула пустой ответ")
@@ -235,13 +267,21 @@ def generate_post(user_id: str, prompt: str) -> str:
     company = state.get("companies", {}).get(user_id, {})
     profile_text = json.dumps(company, ensure_ascii=False)
     instructions = (
-        "Ты маркетолог компании. Подготовь готовый пост для MAX на русском языке. "
-        "Пиши ясно и естественно, без выдуманных фактов, цен, обещаний и статистики. "
-        "Если данных не хватает, задай уточняющий вопрос вместо публикации. "
-        "Верни только текст публикации, без пояснений.\n"
-        f"Профиль компании: {profile_text}\nЗадача: {prompt}"
+        "Подготовь готовый пост для MAX на русском языке, не задавая заказчику вопросов. "
+        "Выбери уместный угол подачи: практическая польза, короткая история из известных деталей "
+        "или то, чем тема может заинтересовать аудиторию. Начни с короткого заголовка, затем дай "
+        "2–4 коротких абзаца живым естественным языком. Пиши конкретно, без канцелярита, "
+        "шаблонных фраз, повторов и лишних хештегов. Допустимы до трёх уместных эмодзи. "
+        "Не выдумывай даты, место, участников, результаты, цифры, договорённости и другие факты. "
+        "Если деталей мало, сделай короткий нейтральный пост и просто опусти неизвестное; "
+        "не превращай ответ в вопрос, не добавляй заглушки и не проси уточнений. "
+        "Если в задании названы компания и событие, но деталей нет, можно написать, что компания "
+        "поддержала или подготовила задание для события, только если это прямо следует из запроса "
+        "или профиля. Если связь между названиями неясна, упомяни их раздельно или опусти спорную связь. "
+        "Верни только текст публикации, без пояснений, до 800 символов.\n"
+        f"ПРОФИЛЬ КОМПАНИИ: {profile_text}\nЗАДАНИЕ: {prompt}"
     )
-    return ai_text(user_id, prompt, instructions)[:3500]
+    return ai_text(user_id, prompt, instructions)[:800]
 
 
 def get_web_image(user_id: str, prompt: str):
@@ -288,7 +328,7 @@ def get_owner(update):
 
 
 def connect_user_channel(user_id: str, channel_id: str):
-    member = max_api(f"/chats/{channel_id}/members/me")
+    member = max_api(f"/chats/{channel_id}/members/me", timeout=15)
     permissions = set(member.get("permissions") or [])
     if not member.get("is_admin") or not ({"write", "post_edit_delete_message"} & permissions):
         send_text(user_id, "Канал найден, но у бота нет права публикации. Выдайте право «Публиковать сообщения» и добавьте бота снова.")
@@ -327,7 +367,7 @@ def greet(user_id: str):
         "Здравствуйте! Я AI-маркетолог. Ваш профиль и канал будут храниться отдельно от других пользователей.\n\n"
         "Напишите задачу обычным сообщением, например: «Подготовь пост о новой услуге». "
         "Я пришлю черновик. В канал он попадёт только после вашего одобрения.\n\n"
-        "Команды: /id, /chatgpt, /company, /channel, /schedule, /analytics, /help.", buttons)
+        "Команды: /id, /chatgpt, /api, /company, /channel, /schedule, /analytics, /help.", buttons)
 
 
 def begin_registration(user_id: str):
@@ -370,51 +410,82 @@ def handle_registration(user_id: str, text: str):
             send_text(user_id, f"Профиль сохранён, но канал не удалось подключить: {str(exc)[:180]}")
     send_text(user_id,
         f"✅ Профиль компании сохранён.\nКомпания: {form['company_name']}\n\n"
-        "Теперь подключите ChatGPT и канал. Канал найдётся автоматически после добавления бота администратором.",
+        "Теперь подключите ChatGPT или API и канал. Канал найдётся автоматически после добавления бота администратором.",
         [[callback_button("🔐 Подключить ChatGPT", "connect_chatgpt")],
+         [callback_button("🔑 Подключить AI API", "api")],
          [callback_button("📣 Подключить канал", "connect_channel")],
          [callback_button("✍️ Создать пост", "create_post"), callback_button("👤 Мой профиль", "profile")],
          [callback_button("📊 Публикации", "analytics"), callback_button("⏰ Расписание", "schedule")]],
     )
 
 
-def start_chatgpt_login(user_id: str):
-    try:
-        login = subprocess.Popen(
-            [node_command(), "siwc.mjs", "login-max", user_id], cwd=ROOT,
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
-        )
-    except (OSError, RuntimeError) as exc:
-        send_text(user_id, str(exc))
+def start_api_login(user_id: str, provider: str | None = None):
+    if provider not in API_PROVIDERS:
+        buttons = [
+            [callback_button("OpenAI API", "connect_api:openai"), callback_button("Gemini API", "connect_api:gemini")],
+            [callback_button("Claude API", "connect_api:claude"), callback_button("DeepSeek API", "connect_api:deepseek")],
+        ]
+        send_text(user_id, "Выберите API-провайдера. Ключ вводится в локальной форме на компьютере, где запущен бот.", buttons)
         return
+    start_login_process(user_id, "api", provider)
+
+
+def start_chatgpt_login(user_id: str):
+    start_login_process(user_id, "chatgpt")
+
+
+def start_login_process(user_id: str, kind: str, provider: str | None = None):
+    with AUTH_LOGIN_LOCK:
+        if user_id in auth_logins:
+            send_text(user_id, "Для этого аккаунта уже начат вход. Завершите его, затем попробуйте снова.")
+            return
+        command = "api-login-max" if kind == "api" else "login-max"
+        args = [node_command(), "siwc.mjs", command, user_id]
+        if provider:
+            args.append(provider)
+        try:
+            login = subprocess.Popen(args, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     text=True, encoding="utf-8")
+        except (OSError, RuntimeError) as exc:
+            send_text(user_id, str(exc))
+            return
+        auth_logins[user_id] = login
     try:
         info = json.loads(login.stdout.readline())
-        send_text(user_id,
-            "Откройте ссылку, войдите в ChatGPT и разрешите использовать возможности своего плана. "
-            "После завершения входа вернитесь сюда.",
-            [[{"type": "link", "text": "Войти через ChatGPT", "url": info["url"]}]],
-        )
+        if kind == "api":
+            text = f"Откройте локальную страницу на компьютере с ботом и введите там ключ {API_PROVIDERS[provider][0]}. Ключ не отправляйте в MAX. Ссылка действует 10 минут."
+            button = {"type": "link", "text": "Открыть форму подключения", "url": info["url"]}
+        else:
+            text = "Откройте ссылку, войдите в ChatGPT и разрешите использовать возможности своего плана. После завершения входа вернитесь сюда."
+            button = {"type": "link", "text": "Войти через ChatGPT", "url": info["url"]}
+        send_text(user_id, text, [[button]])
     except Exception:
         login.terminate()
-        send_text(user_id, "Не получилось создать ссылку входа. Проверьте npm install и повторите /chatgpt.")
+        with AUTH_LOGIN_LOCK:
+            auth_logins.pop(user_id, None)
+        send_text(user_id, "Не получилось создать ссылку входа. Проверьте Node.js, npm install и повторите команду.")
         return
 
     def finish():
         try:
             code = login.wait(timeout=660)
-            if code == 0 and chatgpt_connected(user_id):
-                send_text(user_id, "✅ ChatGPT подключён. Выберите действие в меню или напишите задачу для поста.", [
+            if code == 0:
+                name = API_PROVIDERS[provider][0] if provider else "ChatGPT"
+                send_text(user_id, f"✅ {name} подключён. Выберите действие или напишите тему поста.", [
                     [callback_button("✍️ Создать пост", "create_post"), callback_button("👤 Мой профиль", "profile")],
                     [callback_button("📊 Публикации", "analytics"), callback_button("⏰ Расписание", "schedule")],
                 ])
             else:
-                send_text(user_id, "Вход не завершился. Попробуйте /chatgpt ещё раз.")
+                send_text(user_id, "Вход не завершился. Если OpenAI сообщает о неподдерживаемом регионе, это ограничение сервиса; попробуйте API через /api.")
         except subprocess.TimeoutExpired:
             login.terminate()
-            send_text(user_id, "Ссылка истекла. Для нового входа отправьте /chatgpt.")
+            send_text(user_id, "Ссылка истекла. Повторите команду подключения.")
         finally:
             if login.stdout:
                 login.stdout.close()
+            with AUTH_LOGIN_LOCK:
+                if auth_logins.get(user_id) is login:
+                    auth_logins.pop(user_id, None)
     threading.Thread(target=finish, daemon=True).start()
 
 
@@ -517,6 +588,9 @@ def handle_message(update):
     message = update.get("message", {})
     body = message.get("body") or {}
     text = (body.get("text") or "").strip()
+    if re.search(r"\b(?:sk-[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{20,})", text):
+        send_text(user_id, "API-ключ уже попал в историю MAX. Удалите это сообщение вручную и подключите ключ через /api, введя его только в локальной форме на компьютере с ботом.")
+        return
     image_attachment = next((a for a in body.get("attachments", []) if a.get("type") == "image"), None)
     image_payload = (image_attachment or {}).get("payload") or {}
     incoming_image = image_payload.get("token")
@@ -552,14 +626,34 @@ def handle_message(update):
     if text == "/reset":
         send_text(user_id, "Сбросить профиль, подключение ChatGPT, канал и ожидающие черновики? Опубликованные посты останутся в канале.", [[callback_button("Подтвердить сброс", "reset_confirm"), callback_button("Отмена", "reset_cancel")]])
         return
-    if text == "/channel":
-        send_text(user_id,
-            "Добавьте этого бота в нужный MAX-канал как администратора с правом публикации. "
-            "MAX сам передаст боту ID канала, и он подтвердит подключение здесь."
-        )
+    if text == "/channel" or text.startswith("/channel "):
+        parts = text.split(maxsplit=1)
+        if len(parts) == 2:
+            channel_id = parts[1].strip()
+            if not re.fullmatch(r"[1-9][0-9]{0,19}", channel_id):
+                send_text(user_id, "Укажите числовой ID канала: /channel 123456789. Ссылку на канал пока подключить нельзя.")
+                return
+            try:
+                connect_user_channel(user_id, channel_id)
+            except Exception as exc:
+                send_text(user_id, f"Не удалось проверить канал. Проверьте его ID, права бота и соединение с MAX. Ошибка: {str(exc)[:140]}")
+            return
+        channel_id = state.get("channels", {}).get(user_id)
+        if channel_id:
+            send_text(user_id, f"✅ Канал уже подключён (ID {channel_id}). Чтобы сменить канал, отправьте /channel <ID канала>.")
+        else:
+            send_text(user_id,
+                "Чтобы подключить канал: добавьте бота в администраторы с правом «Публиковать сообщения». "
+                "Если MAX не подтвердит добавление, отправьте сюда /channel <числовой ID канала>."
+            )
         return
     if text == "/chatgpt":
         start_chatgpt_login(user_id)
+        return
+    if text.startswith("/api"):
+        parts = text.split(maxsplit=1)
+        provider = parts[1].strip().casefold() if len(parts) == 2 else None
+        start_api_login(user_id, provider)
         return
     if text == "/cancel":
         state.get("registration", {}).pop(user_id, None)
@@ -576,7 +670,10 @@ def handle_message(update):
         send_text(user_id, "Сначала подключите MAX-канал: отправьте /channel и добавьте бота администратором с правом публикации.")
         return
     if not chatgpt_connected(user_id):
-        send_text(user_id, "Сначала подключите ChatGPT, чтобы готовить посты.", [[callback_button("🔐 Подключить ChatGPT", "connect_chatgpt")]])
+        send_text(user_id, "Сначала подключите ChatGPT через /chatgpt или API через /api.", [
+            [callback_button("🔐 Подключить ChatGPT", "connect_chatgpt")],
+            [callback_button("🔑 Подключить AI API", "api")],
+        ])
         return
     if not text and incoming_image:
         state.setdefault("uploads", {})[user_id] = incoming_image
@@ -652,7 +749,7 @@ def handle_callback(update):
         "profile": (profile_text(user_id), None),
         "analytics": (publication_summary(user_id), None),
         "schedule": ("Расписание черновиков\n/schedule 09:00 — ежедневно подготовить черновик\n/schedule off — выключить. Публикация всегда ждёт вашего одобрения.", None),
-        "help": ("Напишите задачу обычным сообщением или нажмите «Создать пост».\n/chatgpt — подключить ChatGPT\n/company — изменить профиль\n/channel — подключить канал\n/schedule — расписание\n/analytics — история публикаций\n/status — статус черновика\n/reset — сбросить профиль", None),
+        "help": ("Напишите задачу обычным сообщением или нажмите «Создать пост».\n/chatgpt — вход через ChatGPT\n/api — подключить OpenAI, Gemini, Claude или DeepSeek\n/company — изменить профиль\n/channel — подключить канал\n/schedule — расписание\n/analytics — история публикаций\n/status — статус черновика\n/reset — сбросить профиль", None),
     }
     if payload in menu_actions:
         send_text(user_id, menu_actions[payload][0])
@@ -671,6 +768,12 @@ def handle_callback(update):
         return
     if callback.get("payload") == "connect_chatgpt":
         start_chatgpt_login(user_id)
+        return
+    if payload == "api":
+        start_api_login(user_id)
+        return
+    if payload.startswith("connect_api:"):
+        start_api_login(user_id, payload.partition(":")[2])
         return
     if callback.get("payload") == "connect_channel":
         send_text(user_id, "Добавьте этого бота администратором MAX-канала с правом публикации. ID определится автоматически после добавления.")
@@ -737,15 +840,20 @@ def reset_account(user_id: str):
     auth_dir = ROOT / ".auth" / "max" / user_id
     shutil.rmtree(auth_dir, ignore_errors=True)
     save_state()
-    send_text(user_id, "Профиль, подключение ChatGPT, канал и ожидающие черновики сброшены. Опубликованные записи остались в канале. Отправьте /start для настройки заново.")
+    send_text(user_id, "Профиль, подключение AI, канал и ожидающие черновики сброшены. Опубликованные записи остались в канале. Отправьте /start для настройки заново.")
 
 
 def main():
     if not TOKEN:
         raise SystemExit("Добавьте MAX_BOT_TOKEN в .env")
-    print("Запущен MAX polling-режим для разработки. Для production используйте Webhook.")
+    print(f"MAX polling запущен из {ROOT}. Для production используйте Webhook.", flush=True)
     threading.Thread(target=scheduled_job, daemon=True).start()
-    params = {"timeout": 30, "limit": 100, "types": "bot_started,bot_added,message_created,message_callback"}
+    # Do not filter types server-side: MAX deployments differ in how they
+    # serialize array query parameters, and an invalid filter silently hides
+    # message_created / bot_started updates.
+    params = {"timeout": 15, "limit": 100}
+    poll_errors = 0
+    poll_connected = False
     while True:
         try:
             # The marker advances after each response. Refresh it before every
@@ -755,8 +863,13 @@ def main():
                 params["marker"] = state["marker"]
             else:
                 params.pop("marker", None)
-            result = max_api("/updates", params=params)
+            result = max_api("/updates", params=params, timeout=20)
+            poll_errors = 0
+            if not poll_connected:
+                print(f"MAX Long Poll: соединение установлено; обновлений: {len(result.get('updates', []))}.", flush=True)
+                poll_connected = True
             for update in result.get("updates", []):
+                print(f"MAX update received: {update.get('update_type', 'unknown')}", flush=True)
                 if update.get("update_type") == "bot_added":
                     handle_bot_added(update)
                 elif update.get("update_type") == "bot_started":
@@ -777,8 +890,11 @@ def main():
             print("MAX-бот остановлен")
             break
         except Exception as exc:
-            print(f"MAX polling error: {exc}")
-            time.sleep(3)
+            poll_errors += 1
+            poll_connected = False
+            if poll_errors == 1 or poll_errors % 5 == 0:
+                print(f"MAX polling error (повтор {poll_errors}): {exc}", flush=True)
+            time.sleep(min(2 ** min(poll_errors - 1, 3), 8))
 
 
 if __name__ == "__main__":

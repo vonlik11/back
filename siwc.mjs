@@ -10,7 +10,7 @@ const directory = path.dirname(fileURLToPath(import.meta.url));
 const command = process.argv[2];
 const telegramId = process.argv[3];
 const platform = command?.endsWith("-max") ? "max" : command?.endsWith("-vk") ? "vk" : "telegram";
-const accountCommand = ["login-telegram", "login-max", "login-vk", "infer-max", "infer-api-max", "connect-api-max", "infer-vk"].includes(command);
+const accountCommand = ["login-telegram", "login-max", "login-vk", "api-login", "api-login-max", "api-login-vk", "infer-max", "infer-api-max", "connect-api-max", "infer-vk", "infer-api-vk", "connect-api-vk"].includes(command);
 if ((telegramId !== undefined && !/^[1-9][0-9]{0,15}$/.test(telegramId)) || (["login-telegram", "login-max", "login-vk"].includes(command) && !telegramId)) {
   console.error("Укажите корректный ID аккаунта.");
   process.exit(2);
@@ -200,37 +200,150 @@ async function getAccessToken() {
 }
 
 const model = process.env.CHATGPT_MODEL || "gpt-6.1-sol";
+const apiProviders = {
+  openai: {
+    name: "OpenAI API",
+    model: process.env.OPENAI_API_MODEL || model,
+    keyUrl: "https://platform.openai.com/api-keys",
+  },
+  gemini: {
+    name: "Google Gemini API",
+    model: process.env.GEMINI_MODEL || "gemini-3.8-flash",
+    keyUrl: "https://aistudio.google.com/app/apikey",
+  },
+  claude: {
+    name: "Anthropic Claude API",
+    model: process.env.CLAUDE_MODEL || "claude-sonnet-5",
+    keyUrl: "https://console.anthropic.com/settings/keys",
+  },
+  deepseek: {
+    name: "DeepSeek API",
+    model: process.env.DEEPSEEK_MODEL || "deepseek-flash",
+    keyUrl: "https://platform.deepseek.com/api_keys",
+  },
+};
 
-async function connectApiKey(apiKey) {
-  if (!telegramId || typeof apiKey !== "string" || !/^sk-[A-Za-z0-9_-]{16,500}$/.test(apiKey) || apiKey.startsWith("sk-admin-")) {
+function apiError(response, body = "") {
+  if (response.status === 401) throw new Error("api_http_401");
+  if (response.status === 402) throw new Error("api_http_402");
+  if (response.status === 403) throw new Error("api_http_403");
+  if (response.status === 404) throw new Error("api_http_404");
+  if (response.status === 429) throw new Error("api_http_429");
+  if (!response.ok) throw new Error(`api_http_${response.status}`);
+  if (body) throw new Error("api_unavailable");
+}
+
+function apiKeyHeaders(provider, apiKey) {
+  if (provider === "gemini") return { "x-goog-api-key": apiKey, "content-type": "application/json" };
+  if (provider === "claude") return { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "content-type": "application/json" };
+  return { authorization: `Bearer ${apiKey}`, "content-type": "application/json" };
+}
+
+function readApiCredential() {
+  const value = unprotect(fs.readFileSync(apiKeyFile, "utf8"));
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed && typeof parsed === "object" && typeof parsed.apiKey === "string") return parsed;
+  } catch { /* Backward compatibility with older installations storing only the key. */ }
+  return { provider: "openai", apiKey: value, model: process.env.OPENAI_API_MODEL || model };
+}
+
+async function validateApiKey(provider, apiKey, providerModel) {
+  const headers = apiKeyHeaders(provider, apiKey);
+  let url;
+  if (provider === "openai") url = `https://api.openai.com/v1/models/${encodeURIComponent(providerModel)}`;
+  else if (provider === "gemini") url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(providerModel)}`;
+  else if (provider === "claude") url = `https://api.anthropic.com/v1/models/${encodeURIComponent(providerModel)}`;
+  else url = "https://api.deepseek.com/models";
+  const response = await fetch(url, { headers, signal: AbortSignal.timeout(20_000), redirect: "error" });
+  const raw = await response.text();
+  if (!response.ok) apiError(response, raw);
+  let data = {};
+  try { data = JSON.parse(raw); } catch { throw new Error("api_unavailable"); }
+  if (provider === "gemini" && Array.isArray(data.supportedGenerationMethods) && !data.supportedGenerationMethods.includes("generateContent")) {
+    throw new Error("api_http_404");
+  }
+  if (provider === "deepseek" && Array.isArray(data.data) && !data.data.some(item => item.id === providerModel)) {
+    throw new Error("api_http_404");
+  }
+}
+
+async function connectApiKey(apiKey, provider = "openai") {
+  const providerConfig = apiProviders[provider];
+  if (!telegramId || !providerConfig || typeof apiKey !== "string" || apiKey.length < 10 || apiKey.length > 1000 || /\s/.test(apiKey) || (provider === "openai" && apiKey.startsWith("sk-admin-"))) {
     throw new Error("invalid_key");
   }
-  const response = await fetch(`https://api.openai.com/v1/models/${encodeURIComponent(model)}`, {
-    headers: { authorization: `Bearer ${apiKey}` },
-    signal: AbortSignal.timeout(20_000),
-    redirect: "error",
-  });
-  await response.body?.cancel();
-  if (!response.ok) throw new Error(`api_http_${response.status}`);
-  writePrivateFile(apiKeyFile, protect(apiKey));
+  await validateApiKey(provider, apiKey, providerConfig.model);
+  writePrivateFile(apiKeyFile, protect(JSON.stringify({ provider, apiKey, model: providerConfig.model })));
   writePrivateFile(providerFile, "api");
 }
 
-async function infer(payload, useApiKey = false) {
-  const token = useApiKey
-    ? unprotect(fs.readFileSync(apiKeyFile, "utf8"))
-    : (await getAccessToken()).accessToken;
-  const input = [];
-  for (const item of payload.history || []) input.push({ role: item.role === "assistant" ? "assistant" : "user", content: item.text });
-  input.push({ role: "user", content: payload.prompt });
-  const response = await fetch("https://api.openai.com/v1/responses", { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ model, instructions: payload.instructions, input, store: false, stream: true }), redirect: "error" });
-  if (!response.ok) {
-    if (useApiKey) {
-      await response.body?.cancel();
-      throw new Error(`api_http_${response.status}`);
+function apiLoginPage(provider, token, message = "") {
+  const name = apiProviders[provider].name;
+  const status = message ? `<p role="status">${message}</p>` : "";
+  return `<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Подключение AI API</title><style>body{font:16px system-ui;max-width:520px;margin:10vh auto;padding:24px;background:#f4f5f7;color:#202124}main{background:white;padding:28px;border-radius:16px;box-shadow:0 4px 22px #0001}label,input,button{display:block;width:100%;box-sizing:border-box;margin:12px 0}input{padding:12px;border:1px solid #bbb;border-radius:8px}button{padding:12px;background:#2463eb;color:white;border:0;border-radius:8px;font-weight:600}p{line-height:1.5}</style><main><h1>Подключить ${name}</h1>${status}<p>Ключ отправляется только локальному боту на этом компьютере. Он будет проверен и сохранён в зашифрованном локальном файле.</p><p><a href="${apiProviders[provider].keyUrl}" target="_blank" rel="noreferrer">Открыть страницу создания API-ключа</a></p><form method="post" action="/connect?token=${encodeURIComponent(token)}"><label for="apiKey">API-ключ</label><input id="apiKey" name="apiKey" type="password" required minlength="10" maxlength="1000" autocomplete="off" autocapitalize="off" spellcheck="false"><button type="submit">Проверить и подключить</button></form></main></html>`;
+}
+
+async function apiLogin(provider) {
+  if (!telegramId || !apiProviders[provider]) throw new Error("Неизвестный API-провайдер или аккаунт.");
+  const token = crypto.randomBytes(32).toString("base64url");
+  let consumed = false, busy = false;
+  const server = http.createServer(async (req, res) => {
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+    const url = new URL(req.url, "http://127.0.0.1");
+    const supplied = url.searchParams.get("token") || "";
+    const validToken = supplied.length === token.length && crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(token));
+    if (!validToken || consumed) { res.writeHead(404).end("Not found"); return; }
+    if (req.method === "GET" && url.pathname === "/") {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end(apiLoginPage(provider, token));
+      return;
     }
+    if (req.method !== "POST" || url.pathname !== "/connect" || busy) { res.writeHead(404).end("Not found"); return; }
+    busy = true;
+    try {
+      let raw = "";
+      for await (const chunk of req) {
+        raw += chunk;
+        if (raw.length > 4096) throw new Error("invalid_key");
+      }
+      const apiKey = new URLSearchParams(raw).get("apiKey") || "";
+      await connectApiKey(apiKey, provider);
+      consumed = true;
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end("<!doctype html><meta charset='utf-8'><title>Готово</title><h2>API подключён ✅</h2><p>Вернитесь в чат с ботом.</p>");
+      server.close();
+    } catch (error) {
+      const messages = {
+        invalid_key: "Проверьте, что это API-ключ выбранного сервиса, а не пароль или административный ключ.",
+        api_http_401: "Провайдер отклонил ключ. Проверьте ключ или создайте новый.",
+        api_http_402: "Проверьте оплату и баланс API-аккаунта.",
+        api_http_403: "У ключа нет доступа к API или модели. Проверьте права проекта и доступность сервиса.",
+        api_http_404: "Модель не найдена или недоступна ключу. Проверьте имя в .env и повторите подключение.",
+        api_http_429: "Превышен лимит API-провайдера. Попробуйте позже или проверьте оплату.",
+      };
+      const notice = messages[error.message] || "Не удалось проверить ключ из-за ошибки соединения. Попробуйте ещё раз.";
+      res.writeHead(400, { "content-type": "text/html; charset=utf-8" }).end(apiLoginPage(provider, token, notice));
+      busy = false;
+    }
+  });
+  await new Promise((resolve, reject) => server.once("error", reject).listen(0, "127.0.0.1", resolve));
+  const closed = new Promise(resolve => server.once("close", resolve));
+  const expiry = setTimeout(() => server.close(), 10 * 60 * 1000);
+  const address = server.address();
+  process.stdout.write(JSON.stringify({ url: `http://127.0.0.1:${address.port}/?token=${encodeURIComponent(token)}`, provider: apiProviders[provider].name }) + "\n");
+  await closed;
+  clearTimeout(expiry);
+  if (!consumed) process.exitCode = 1;
+}
+
+async function responseText(response, label) {
+  if (!response.ok) {
     const details = await response.text();
-    throw new Error(`ChatGPT plan request: ${response.status} ${details.slice(0, 350)}`);
+    if (label !== "ChatGPT plan") apiError(response, details);
+    throw new Error(`${label} request: ${response.status} ${details.slice(0, 350)}`);
   }
   let buffer = "", text = "", completed = false;
   for await (const chunk of response.body.pipeThrough(new TextDecoderStream())) {
@@ -241,11 +354,71 @@ async function infer(payload, useApiKey = false) {
       if (!data || data === "[DONE]") continue;
       let event; try { event = JSON.parse(data); } catch { continue; }
       if (event.type === "response.output_text.delta") text += event.delta || "";
-      else if (event.type === "response.failed") throw new Error(`ChatGPT response failed: ${event.response?.error?.code || "unknown_error"}`);
+      else if (event.type === "response.failed") throw new Error(`${label} response failed: ${event.response?.error?.code || "unknown_error"}`);
       else if (event.type === "response.completed") completed = true;
     }
   }
-  if (!completed || !text.trim()) throw new Error("ChatGPT stream ended before response.completed.");
+  if (!completed || !text.trim()) throw new Error(`${label} stream ended before response.completed.`);
+  return text;
+}
+
+function chatMessages(payload) {
+  return [
+    ...(payload.history || []).map(item => ({ role: item.role === "assistant" ? "assistant" : "user", content: item.text })),
+    { role: "user", content: payload.prompt },
+  ];
+}
+
+async function inferApi(payload) {
+  const credentials = readApiCredential();
+  const provider = credentials.provider || "openai";
+  const providerConfig = apiProviders[provider];
+  if (!providerConfig) throw new Error("api_unavailable");
+  const providerModel = credentials.model || providerConfig.model;
+  const headers = apiKeyHeaders(provider, credentials.apiKey);
+  const messages = chatMessages(payload);
+  let response;
+  if (provider === "openai") {
+    const input = messages.map(item => ({ role: item.role, content: item.content }));
+    response = await fetch("https://api.openai.com/v1/responses", { method: "POST", headers, body: JSON.stringify({ model: providerModel, instructions: payload.instructions, input, store: false, stream: true }), redirect: "error", signal: AbortSignal.timeout(120_000) });
+    return responseText(response, "OpenAI API");
+  }
+  if (provider === "gemini") {
+    const contents = messages.map(item => ({ role: item.role === "assistant" ? "model" : "user", parts: [{ text: item.content }] }));
+    response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(providerModel)}:generateContent`, {
+      method: "POST", headers, body: JSON.stringify({ systemInstruction: { parts: [{ text: payload.instructions }] }, contents, generationConfig: { maxOutputTokens: 4096 } }), redirect: "error", signal: AbortSignal.timeout(120_000),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) apiError(response, JSON.stringify(result));
+    return (result.candidates?.[0]?.content?.parts || []).map(part => part.text || "").join("").trim();
+  }
+  if (provider === "claude") {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST", headers, body: JSON.stringify({ model: providerModel, system: payload.instructions, messages, max_tokens: 4096 }), redirect: "error", signal: AbortSignal.timeout(120_000),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) apiError(response, JSON.stringify(result));
+    return (result.content || []).filter(part => part.type === "text").map(part => part.text || "").join("").trim();
+  }
+  response = await fetch("https://api.deepseek.com/chat/completions", {
+    method: "POST", headers, body: JSON.stringify({ model: providerModel, messages: [{ role: "system", content: payload.instructions }, ...messages], stream: false }), redirect: "error", signal: AbortSignal.timeout(120_000),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) apiError(response, JSON.stringify(result));
+  return String(result.choices?.[0]?.message?.content || "").trim();
+}
+
+async function infer(payload, useApiKey = false) {
+  if (useApiKey) {
+    const text = await inferApi(payload);
+    if (!text) throw new Error("api_unavailable");
+    process.stdout.write(JSON.stringify({ text }));
+    return;
+  }
+  const token = (await getAccessToken()).accessToken;
+  const input = chatMessages(payload).map(item => ({ role: item.role, content: item.content }));
+  const response = await fetch("https://api.openai.com/v1/responses", { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ model, instructions: payload.instructions, input, store: false, stream: true }), redirect: "error", signal: AbortSignal.timeout(120_000) });
+  const text = await responseText(response, "ChatGPT plan");
   process.stdout.write(JSON.stringify({ text }));
 }
 
@@ -254,16 +427,17 @@ else if (command === "login-new") await login(true);
 else if (command === "login-telegram") await login(false, true);
 else if (command === "login-max") await login(false, true);
 else if (command === "login-vk") await login(false, true);
+else if (["api-login", "api-login-max", "api-login-vk"].includes(command)) await apiLogin(process.argv[4] || "");
 else if (command === "status") {
   try { const c = loadCredentials(); console.log(JSON.stringify({ connected: Boolean(c.accessToken && c.scopes.includes("chatgpt.tokens.use.direct") && (c.expiresAt > Date.now() + 60_000 || c.refreshToken)), email: c.email })); }
   catch { console.log(JSON.stringify({ connected: false })); }
-} else if (["infer", "infer-api", "connect-api", "infer-max", "infer-api-max", "connect-api-max", "infer-vk"].includes(command)) {
+} else if (["infer", "infer-api", "connect-api", "infer-max", "infer-api-max", "connect-api-max", "infer-vk", "infer-api-vk", "connect-api-vk"].includes(command)) {
   let input = ""; for await (const chunk of process.stdin) input += chunk;
   try {
     if (accountCommand && !telegramId) throw new Error("missing_account");
     const payload = JSON.parse(input);
-    if (["connect-api", "connect-api-max"].includes(command)) await connectApiKey(payload.apiKey);
-    else await infer(payload, ["infer-api", "infer-api-max"].includes(command));
+    if (["connect-api", "connect-api-max", "connect-api-vk"].includes(command)) await connectApiKey(payload.apiKey, payload.provider);
+    else await infer(payload, ["infer-api", "infer-api-max", "infer-api-vk"].includes(command));
   } catch (error) {
     const safeCode = /^(invalid_key|api_http_[0-9]{3})$/.test(error.message) ? error.message : "api_unavailable";
     if (command === "infer-vk") {
@@ -276,8 +450,8 @@ else if (command === "status") {
       else if (/fetch failed|ECONN|ETIMEDOUT|ENOTFOUND|network|UND_ERR|SSL/i.test(detail)) code = "openai_network_error";
       process.stderr.write(code);
     } else {
-      process.stderr.write(command === "infer" ? error.message : safeCode);
+      process.stderr.write(["api-login", "api-login-max", "api-login-vk", "connect-api", "connect-api-max", "connect-api-vk", "infer-api", "infer-api-max", "infer-api-vk"].includes(command) ? safeCode : error.message);
     }
     process.exitCode = 1;
   }
-} else { console.error("Use: node siwc.mjs login | status | infer | connect-api | infer-api | login-max | infer-max | login-vk | infer-vk"); process.exitCode = 2; }
+} else { console.error("Use: node siwc.mjs login | status | infer | connect-api | infer-api | login-max | infer-max | infer-api-max | connect-api-max | login-vk | infer-vk | infer-api-vk | connect-api-vk"); process.exitCode = 2; }
